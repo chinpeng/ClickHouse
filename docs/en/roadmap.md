@@ -1,19 +1,17 @@
 # Roadmap
 
-## Q3 2017
+## Q2 2019
 
-- ` SYSTEM queries`
-- Limit the number of parallel downloads from replicas
-- Finish support for `NULL`
-- `SELECT db.table.column`
+- DDL for dictionaries
+- Integration with S3-like object stores
+- Multiple storages for hot/cold data, JBOD support
 
-## Q4 2017
+## Q3 2019
 
-- An arbitrary key for partitioning engines of the MergeTree family
-- Enhance the ` JOIN syntax`  for compatibility with the SQL standard
-- Resource pools for queries (CPU, disk I/O, and network bandwidth)
+- JOIN execution improvements:
+    - Distributed join not limited by memory
+- Resource pools for more precise distribution of cluster capacity between users
+- Fine-grained authorization
+- Integration with external authentication services
 
-## Q1 2018
-
-- Initial support for `UPDATE` and `DELETE`
-
+[Original article](https://clickhouse.yandex/docs/en/roadmap/) <!--hide-->

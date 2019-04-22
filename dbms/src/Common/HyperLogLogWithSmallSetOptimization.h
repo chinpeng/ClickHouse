@@ -45,12 +45,14 @@ private:
         Large * tmp_large = new Large;
 
         for (const auto & x : small)
-            tmp_large->insert(x);
+            tmp_large->insert(x.getValue());
 
         large = tmp_large;
     }
 
 public:
+    using value_type = Key;
+
     ~HyperLogLogWithSmallSetOptimization()
     {
         if (isLarge())
@@ -80,7 +82,7 @@ public:
             large->insert(value);
     }
 
-    UInt32 size() const
+    UInt64 size() const
     {
         return !isLarge() ? small.size() : large->size();
     }
@@ -97,7 +99,7 @@ public:
         else
         {
             for (const auto & x : rhs.small)
-                insert(x);
+                insert(x.getValue());
         }
     }
 

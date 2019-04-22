@@ -1,8 +1,8 @@
 #pragma once
 
-#include <DataStreams/IProfilingBlockInputStream.h>
-#include <Interpreters/Limits.h>
+#include <DataStreams/IBlockInputStream.h>
 #include <Interpreters/SetVariants.h>
+
 
 namespace DB
 {
@@ -17,22 +17,20 @@ namespace DB
   * set limit_hint to non zero value. So we stop emitting new rows after
   * count of already emitted rows will reach the limit_hint.
   */
-class DistinctSortedBlockInputStream : public IProfilingBlockInputStream
+class DistinctSortedBlockInputStream : public IBlockInputStream
 {
 public:
     /// Empty columns_ means all collumns.
-    DistinctSortedBlockInputStream(const BlockInputStreamPtr & input, const Limits & limits, size_t limit_hint_, const Names & columns);
+    DistinctSortedBlockInputStream(const BlockInputStreamPtr & input, const SizeLimits & set_size_limits, UInt64 limit_hint_, const Names & columns);
 
     String getName() const override { return "DistinctSorted"; }
 
-    String getID() const override;
+    Block getHeader() const override { return children.at(0)->getHeader(); }
 
 protected:
     Block readImpl() override;
 
 private:
-    bool checkLimits() const;
-
     ColumnRawPtrs getKeyColumns(const Block & block) const;
     /// When clearing_columns changed, we can clean HashSet to memory optimization
     /// clearing_columns is a left-prefix of SortDescription exists in key_columns
@@ -61,12 +59,10 @@ private:
     Names columns_names;
     ClearableSetVariants data;
     Sizes key_sizes;
-    size_t limit_hint;
+    UInt64 limit_hint;
 
     /// Restrictions on the maximum size of the output data.
-    size_t max_rows;
-    size_t max_bytes;
-    OverflowMode overflow_mode;
+    SizeLimits set_size_limits;
 };
 
 }

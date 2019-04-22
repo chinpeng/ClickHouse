@@ -1,12 +1,12 @@
 #include <Core/Defines.h>
-
+#include <Common/Arena.h>
+#include <Common/memcmpSmall.h>
 #include <Columns/Collator.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsCommon.h>
 #include <DataStreams/ColumnGathererStream.h>
 
-/// Used in the `reserve` method, when the number of rows is known, but sizes of elements are not.
-#define APPROX_STRING_SIZE 64
+#include <common/unaligned.h>
 
 
 namespace DB
@@ -24,7 +24,7 @@ MutableColumnPtr ColumnString::cloneResized(size_t to_size) const
     auto res = ColumnString::create();
 
     if (to_size == 0)
-        return std::move(res);
+        return res;
 
     size_t from_size = size();
 
@@ -59,7 +59,7 @@ MutableColumnPtr ColumnString::cloneResized(size_t to_size) const
         }
     }
 
-    return std::move(res);
+    return res;
 }
 
 
@@ -88,7 +88,7 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
     else
     {
         size_t old_size = offsets.size();
-        size_t prev_max_offset = old_size ? offsets.back() : 0;
+        size_t prev_max_offset = offsets.back();    /// -1th index is Ok, see PaddedPODArray
         offsets.resize(old_size + length);
 
         for (size_t i = 0; i < length; ++i)
@@ -97,22 +97,22 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
 }
 
 
-MutableColumnPtr ColumnString::filter(const Filter & filt, ssize_t result_size_hint) const
+ColumnPtr ColumnString::filter(const Filter & filt, ssize_t result_size_hint) const
 {
     if (offsets.size() == 0)
         return ColumnString::create();
 
     auto res = ColumnString::create();
 
-    Chars_t & res_chars = res->chars;
+    Chars & res_chars = res->chars;
     Offsets & res_offsets = res->offsets;
 
     filterArraysImpl<UInt8>(chars, offsets, res_chars, res_offsets, filt, result_size_hint);
-    return std::move(res);
+    return res;
 }
 
 
-MutableColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) const
+ColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) const
 {
     size_t size = offsets.size();
 
@@ -129,7 +129,7 @@ MutableColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) c
 
     auto res = ColumnString::create();
 
-    Chars_t & res_chars = res->chars;
+    Chars & res_chars = res->chars;
     Offsets & res_offsets = res->offsets;
 
     if (limit == size)
@@ -149,7 +149,7 @@ MutableColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) c
     for (size_t i = 0; i < limit; ++i)
     {
         size_t j = perm[i];
-        size_t string_offset = j == 0 ? 0 : offsets[j - 1];
+        size_t string_offset = offsets[j - 1];
         size_t string_size = offsets[j] - string_offset;
 
         memcpySmallAllowReadWriteOverflow15(&res_chars[current_new_offset], &chars[string_offset], string_size);
@@ -158,7 +158,78 @@ MutableColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) c
         res_offsets[i] = current_new_offset;
     }
 
-    return std::move(res);
+    return res;
+}
+
+
+StringRef ColumnString::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
+{
+    size_t string_size = sizeAt(n);
+    size_t offset = offsetAt(n);
+
+    StringRef res;
+    res.size = sizeof(string_size) + string_size;
+    char * pos = arena.allocContinue(res.size, begin);
+    memcpy(pos, &string_size, sizeof(string_size));
+    memcpy(pos + sizeof(string_size), &chars[offset], string_size);
+    res.data = pos;
+
+    return res;
+}
+
+const char * ColumnString::deserializeAndInsertFromArena(const char * pos)
+{
+    const size_t string_size = unalignedLoad<size_t>(pos);
+    pos += sizeof(string_size);
+
+    const size_t old_size = chars.size();
+    const size_t new_size = old_size + string_size;
+    chars.resize(new_size);
+    memcpy(chars.data() + old_size, pos, string_size);
+
+    offsets.push_back(new_size);
+    return pos + string_size;
+}
+
+
+ColumnPtr ColumnString::index(const IColumn & indexes, size_t limit) const
+{
+    return selectIndexImpl(*this, indexes, limit);
+}
+
+template <typename Type>
+ColumnPtr ColumnString::indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const
+{
+    if (limit == 0)
+        return ColumnString::create();
+
+    auto res = ColumnString::create();
+
+    Chars & res_chars = res->chars;
+    Offsets & res_offsets = res->offsets;
+
+    size_t new_chars_size = 0;
+    for (size_t i = 0; i < limit; ++i)
+        new_chars_size += sizeAt(indexes[i]);
+    res_chars.resize(new_chars_size);
+
+    res_offsets.resize(limit);
+
+    Offset current_new_offset = 0;
+
+    for (size_t i = 0; i < limit; ++i)
+    {
+        size_t j = indexes[i];
+        size_t string_offset = offsets[j - 1];
+        size_t string_size = offsets[j] - string_offset;
+
+        memcpySmallAllowReadWriteOverflow15(&res_chars[current_new_offset], &chars[string_offset], string_size);
+
+        current_new_offset += string_size;
+        res_offsets[i] = current_new_offset;
+    }
+
+    return res;
 }
 
 
@@ -169,15 +240,11 @@ struct ColumnString::less
     explicit less(const ColumnString & parent_) : parent(parent_) {}
     bool operator()(size_t lhs, size_t rhs) const
     {
-        size_t left_len = parent.sizeAt(lhs);
-        size_t right_len = parent.sizeAt(rhs);
+        int res = memcmpSmallAllowOverflow15(
+            parent.chars.data() + parent.offsetAt(lhs), parent.sizeAt(lhs) - 1,
+            parent.chars.data() + parent.offsetAt(rhs), parent.sizeAt(rhs) - 1);
 
-        int res = memcmp(&parent.chars[parent.offsetAt(lhs)], &parent.chars[parent.offsetAt(rhs)], std::min(left_len, right_len));
-
-        if (res != 0)
-            return positive ? (res < 0) : (res > 0);
-        else
-            return positive ? (left_len < right_len) : (left_len > right_len);
+        return positive ? (res < 0) : (res > 0);
     }
 };
 
@@ -208,7 +275,7 @@ void ColumnString::getPermutation(bool reverse, size_t limit, int /*nan_directio
 }
 
 
-MutableColumnPtr ColumnString::replicate(const Offsets & replicate_offsets) const
+ColumnPtr ColumnString::replicate(const Offsets & replicate_offsets) const
 {
     size_t col_size = size();
     if (col_size != replicate_offsets.size())
@@ -217,9 +284,9 @@ MutableColumnPtr ColumnString::replicate(const Offsets & replicate_offsets) cons
     auto res = ColumnString::create();
 
     if (0 == col_size)
-        return std::move(res);
+        return res;
 
-    Chars_t & res_chars = res->chars;
+    Chars & res_chars = res->chars;
     Offsets & res_offsets = res->offsets;
     res_chars.reserve(chars.size() / col_size * replicate_offsets.back());
     res_offsets.reserve(replicate_offsets.back());
@@ -247,7 +314,7 @@ MutableColumnPtr ColumnString::replicate(const Offsets & replicate_offsets) cons
         prev_string_offset = offsets[i];
     }
 
-    return std::move(res);
+    return res;
 }
 
 
@@ -260,7 +327,6 @@ void ColumnString::gather(ColumnGathererStream & gatherer)
 void ColumnString::reserve(size_t n)
 {
     offsets.reserve(n);
-    chars.reserve(n * APPROX_STRING_SIZE);
 }
 
 
@@ -344,6 +410,13 @@ void ColumnString::getPermutationWithCollation(const Collator & collator, bool r
         else
             std::sort(res.begin(), res.end(), lessWithCollation<true>(*this, collator));
     }
+}
+
+
+void ColumnString::protect()
+{
+    getChars().protect();
+    getOffsets().protect();
 }
 
 }

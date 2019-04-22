@@ -1,9 +1,12 @@
+#!/usr/bin/env python2
+import sys
+import os
 from contextlib import contextmanager
-from helpers.network import PartitionManager
-from helpers.test_tools import TSV
-
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from helpers.network import PartitionManager
+from helpers.test_tools import TSV
 from helpers.cluster import ClickHouseCluster
 from helpers.client import QueryRuntimeException, QueryTimeoutExceedException
 
@@ -45,6 +48,28 @@ def test_insertion_sync(started_cluster):
     INSERT INTO distributed_table SELECT today() - 1 as date, number as val FROM system.numbers LIMIT 10000''')
 
     assert node2.query("SELECT count() FROM local_table").rstrip() == '20000'
+
+    # Insert with explicitly specified columns.
+    node1.query('''
+    SET insert_distributed_sync = 1, insert_distributed_timeout = 1;
+    INSERT INTO distributed_table(date, val) VALUES ('2000-01-01', 100500)''')
+
+    # Insert with columns specified in different order.
+    node1.query('''
+    SET insert_distributed_sync = 1, insert_distributed_timeout = 1;
+    INSERT INTO distributed_table(val, date) VALUES (100500, '2000-01-01')''')
+
+    # Insert with an incomplete list of columns.
+    node1.query('''
+    SET insert_distributed_sync = 1, insert_distributed_timeout = 1;
+    INSERT INTO distributed_table(val) VALUES (100500)''')
+
+    expected = TSV('''
+0000-00-00	100500
+2000-01-01	100500
+2000-01-01	100500''')
+    assert TSV(node2.query('SELECT date, val FROM local_table WHERE val = 100500 ORDER BY date')) == expected
+
 
 """
 def test_insertion_sync_fails_on_error(started_cluster):

@@ -13,39 +13,39 @@
 #include <Core/Types.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <common/StringRef.h>
 #include <Common/HashTable/HashMap.h>
 #include <Interpreters/AggregationCommon.h>
 
-#if __SSE4_1__
+#ifdef __SSE4_1__
     #include <smmintrin.h>
 #endif
 
 
 /** Do this:
 for file in MobilePhoneModel PageCharset Params URLDomain UTMSource Referer URL Title; do
- for size in 30000 100000 300000 1000000 5000000; do
-  echo
-  BEST_METHOD=0
-  BEST_RESULT=0
-  for method in {1..11}; do
-   echo -ne $file $size $method '';
-   TOTAL_ELEMS=0
-   for i in {0..1000}; do
-    TOTAL_ELEMS=$(( $TOTAL_ELEMS + $size ))
-    if [[ $TOTAL_ELEMS -gt 25000000 ]]; then break; fi
-    ./hash_map_string_3 $size $method < ${file}.bin 2>&1 |
-     grep HashMap | grep -oE '[0-9\.]+ elem';
-   done | awk -W interactive '{ if ($1 > x) { x = $1 }; printf(".") } END { print x }' | tee /tmp/hash_map_string_3_res;
-   CUR_RESULT=$(cat /tmp/hash_map_string_3_res | tr -d '.')
-   if [[ $CUR_RESULT -gt $BEST_RESULT ]]; then
-    BEST_METHOD=$method
-    BEST_RESULT=$CUR_RESULT
-   fi;
-  done;
-  echo Best: $BEST_METHOD - $BEST_RESULT
- done;
+    for size in 30000 100000 300000 1000000 5000000; do
+        echo
+        BEST_METHOD=0
+        BEST_RESULT=0
+        for method in {1..11}; do
+            echo -ne $file $size $method '';
+            TOTAL_ELEMS=0
+            for i in {0..1000}; do
+                TOTAL_ELEMS=$(( $TOTAL_ELEMS + $size ))
+                if [[ $TOTAL_ELEMS -gt 25000000 ]]; then break; fi
+                ./hash_map_string_3 $size $method < ${file}.bin 2>&1 |
+                    grep HashMap | grep -oE '[0-9\.]+ elem';
+            done | awk -W interactive '{ if ($1 > x) { x = $1 }; printf(".") } END { print x }' | tee /tmp/hash_map_string_3_res;
+            CUR_RESULT=$(cat /tmp/hash_map_string_3_res | tr -d '.')
+            if [[ $CUR_RESULT -gt $BEST_RESULT ]]; then
+                BEST_METHOD=$method
+                BEST_RESULT=$CUR_RESULT
+            fi;
+        done;
+        echo Best: $BEST_METHOD - $BEST_RESULT
+    done;
 done
 */
 
@@ -61,14 +61,14 @@ namespace ZeroTraits \
  \
     template <> \
     inline void set<STRUCT>(STRUCT & x) { x.data = nullptr; } \
-}; \
+} \
  \
 template <> \
 struct DefaultHash<STRUCT> \
 { \
     size_t operator() (STRUCT x) const \
     { \
-        return CityHash_v1_0_2::CityHash64(x.data, x.size);  \
+        return CityHash_v1_0_2::CityHash64(x.data, x.size); \
     } \
 };
 
@@ -94,13 +94,16 @@ inline bool operator==(StringRef_CompareAlwaysTrue, StringRef_CompareAlwaysTrue)
 }
 
 
-#define mix(h) ({                   \
-    (h) ^= (h) >> 23;               \
-    (h) *= 0x2127599bf4325c37ULL;   \
-    (h) ^= (h) >> 47; })
-
 struct FastHash64
 {
+    static inline uint64_t mix(uint64_t h)
+    {
+        h ^= h >> 23;
+        h *= 0x2127599bf4325c37ULL;
+        h ^= h >> 47;
+        return h;
+    }
+
     size_t operator() (StringRef x) const
     {
         const char * buf = x.data;
@@ -161,7 +164,7 @@ struct FNV1a
 };
 
 
-#if __SSE4_1__
+#ifdef __SSE4_1__
 
 struct CrapWow
 {
@@ -251,7 +254,7 @@ struct SimpleHash
 
         if (size < 8)
         {
-#if __SSE4_1__
+#ifdef __SSE4_1__
             return hashLessThan8(x.data, x.size);
 #endif
         }
@@ -288,7 +291,7 @@ struct VerySimpleHash
 
         if (size < 8)
         {
-#if __SSE4_1__
+#ifdef __SSE4_1__
             return hashLessThan8(x.data, x.size);
 #endif
         }
@@ -316,13 +319,13 @@ struct FarmHash64
 {
     size_t operator() (StringRef x) const
     {
-        return farmhash::Hash64(x.data, x.size);
+        return NAMESPACE_FOR_HASH_FUNCTIONS::Hash64(x.data, x.size);
     }
 };
 
 
 template <void metrohash64(const uint8_t * key, uint64_t len, uint32_t seed, uint8_t * out)>
-struct MetroHash64
+struct SMetroHash64
 {
     size_t operator() (StringRef x) const
     {
@@ -339,7 +342,7 @@ struct MetroHash64
 };
 
 
-#if __SSE4_1__
+#ifdef __SSE4_1__
 
 /*struct CRC32Hash
 {
@@ -439,8 +442,8 @@ void NO_INLINE bench(const std::vector<StringRef> & data, const char * name)
     {
         map.emplace(static_cast<const Key &>(data[i]), it, inserted);
         if (inserted)
-            it->second = 0;
-        ++it->second;
+            it->getSecond() = 0;
+        ++it->getSecond();
     }
 
     watch.stop();
@@ -496,7 +499,7 @@ int main(int argc, char ** argv)
     if (!m || m == 3) bench<StringRef, SimpleHash>     (data, "StringRef_SimpleHash");
     if (!m || m == 4) bench<StringRef, FNV1a>          (data, "StringRef_FNV1a");
 
-#if __SSE4_1__
+#ifdef __SSE4_1__
     if (!m || m == 5) bench<StringRef, CrapWow>        (data, "StringRef_CrapWow");
     if (!m || m == 6) bench<StringRef, CRC32Hash>      (data, "StringRef_CRC32Hash");
     if (!m || m == 7) bench<StringRef, CRC32ILPHash>   (data, "StringRef_CRC32ILPHash");
@@ -504,8 +507,8 @@ int main(int argc, char ** argv)
 
     if (!m || m == 8) bench<StringRef, VerySimpleHash> (data, "StringRef_VerySimpleHash");
     if (!m || m == 9) bench<StringRef, FarmHash64>     (data, "StringRef_FarmHash64");
-    if (!m || m == 10) bench<StringRef, MetroHash64<metrohash64_1>>(data, "StringRef_MetroHash64_1");
-    if (!m || m == 11) bench<StringRef, MetroHash64<metrohash64_2>>(data, "StringRef_MetroHash64_2");
+    if (!m || m == 10) bench<StringRef, SMetroHash64<metrohash64_1>>(data, "StringRef_MetroHash64_1");
+    if (!m || m == 11) bench<StringRef, SMetroHash64<metrohash64_2>>(data, "StringRef_MetroHash64_2");
 
     return 0;
 }

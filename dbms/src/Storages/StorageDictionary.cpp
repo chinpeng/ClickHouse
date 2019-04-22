@@ -19,33 +19,36 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int THERE_IS_NO_COLUMN;
 }
 
 
 StorageDictionary::StorageDictionary(
     const String & table_name_,
-    const NamesAndTypesList & columns_,
-    const NamesAndTypesList & materialized_columns_,
-    const NamesAndTypesList & alias_columns_,
-    const ColumnDefaults & column_defaults_,
-    const DictionaryStructure & dictionary_structure_,
+    const ColumnsDescription & columns_,
+    const Context & context,
+    bool attach,
     const String & dictionary_name_)
-    : IStorage{materialized_columns_, alias_columns_, column_defaults_}, table_name(table_name_),
-    columns(columns_), dictionary_name(dictionary_name_),
+    : IStorage{columns_}, table_name(table_name_),
+    dictionary_name(dictionary_name_),
     logger(&Poco::Logger::get("StorageDictionary"))
 {
-    checkNamesAndTypesCompatibleWithDictionary(dictionary_structure_);
+    if (!attach)
+    {
+        const auto & dictionary = context.getExternalDictionaries().getDictionary(dictionary_name);
+        const DictionaryStructure & dictionary_structure = dictionary->getStructure();
+        checkNamesAndTypesCompatibleWithDictionary(dictionary_structure);
+    }
 }
 
 BlockInputStreams StorageDictionary::read(
     const Names & column_names,
     const SelectQueryInfo & /*query_info*/,
     const Context & context,
-    QueryProcessingStage::Enum & processed_stage,
+    QueryProcessingStage::Enum /*processed_stage*/,
     const size_t max_block_size,
     const unsigned /*threads*/)
 {
-    processed_stage = QueryProcessingStage::FetchColumns;
     auto dictionary = context.getExternalDictionaries().getDictionary(dictionary_name);
     return BlockInputStreams{dictionary->getBlockInputStream(column_names, max_block_size)};
 }
@@ -57,9 +60,9 @@ NamesAndTypesList StorageDictionary::getNamesAndTypes(const DictionaryStructure 
     if (dictionary_structure.id)
         dictionary_names_and_types.emplace_back(dictionary_structure.id->name, std::make_shared<DataTypeUInt64>());
     if (dictionary_structure.range_min)
-        dictionary_names_and_types.emplace_back(dictionary_structure.range_min->name, std::make_shared<DataTypeDate>());
+        dictionary_names_and_types.emplace_back(dictionary_structure.range_min->name, dictionary_structure.range_min->type);
     if (dictionary_structure.range_max)
-        dictionary_names_and_types.emplace_back(dictionary_structure.range_max->name, std::make_shared<DataTypeDate>());
+        dictionary_names_and_types.emplace_back(dictionary_structure.range_max->name, dictionary_structure.range_max->type);
     if (dictionary_structure.key)
         for (const auto & attribute : *dictionary_structure.key)
             dictionary_names_and_types.emplace_back(attribute.name, attribute.type);
@@ -73,22 +76,21 @@ NamesAndTypesList StorageDictionary::getNamesAndTypes(const DictionaryStructure 
 void StorageDictionary::checkNamesAndTypesCompatibleWithDictionary(const DictionaryStructure & dictionary_structure) const
 {
     auto dictionary_names_and_types = getNamesAndTypes(dictionary_structure);
-    std::set<NameAndTypePair> namesAndTypesSet(dictionary_names_and_types.begin(), dictionary_names_and_types.end());
+    std::set<NameAndTypePair> names_and_types_set(dictionary_names_and_types.begin(), dictionary_names_and_types.end());
 
-    for (auto & column : columns)
+    for (const auto & column : getColumns().getOrdinary())
     {
-        if (namesAndTypesSet.find(column) == namesAndTypesSet.end())
+        if (names_and_types_set.find(column) == names_and_types_set.end())
         {
             std::string message = "Not found column ";
             message += column.name + " " + column.type->getName();
             message += " in dictionary " + dictionary_name + ". ";
             message += "There are only columns ";
             message += generateNamesAndTypesDescription(dictionary_names_and_types.begin(), dictionary_names_and_types.end());
-            throw Exception(message);
+            throw Exception(message, ErrorCodes::THERE_IS_NO_COLUMN);
         }
     }
 }
-
 
 void registerStorageDictionary(StorageFactory & factory)
 {
@@ -99,14 +101,10 @@ void registerStorageDictionary(StorageFactory & factory)
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
         args.engine_args[0] = evaluateConstantExpressionOrIdentifierAsLiteral(args.engine_args[0], args.local_context);
-        String dictionary_name = typeid_cast<const ASTLiteral &>(*args.engine_args[0]).value.safeGet<String>();
-
-        const auto & dictionary = args.context.getExternalDictionaries().getDictionary(dictionary_name);
-        const DictionaryStructure & dictionary_structure = dictionary->getStructure();
+        String dictionary_name = args.engine_args[0]->as<ASTLiteral &>().value.safeGet<String>();
 
         return StorageDictionary::create(
-            args.table_name, args.columns, args.materialized_columns, args.alias_columns,
-            args.column_defaults, dictionary_structure, dictionary_name);
+            args.table_name, args.columns, args.context, args.attach, dictionary_name);
     });
 }
 

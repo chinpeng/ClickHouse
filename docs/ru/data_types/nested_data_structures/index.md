@@ -1,8 +1,2 @@
 # Вложенные структуры данных
-
-```eval_rst
-.. toctree::
-    :glob:
-    
-    *
-```
+[Оригинальная статья](https://clickhouse.yandex/docs/ru/data_types/nested_data_structures/) <!--hide-->

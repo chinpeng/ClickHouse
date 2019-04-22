@@ -2,7 +2,7 @@
 #include <IO/WriteBufferValidUTF8.h>
 #include <Core/Types.h>
 
-#if __SSE2__
+#ifdef __SSE2__
     #include <emmintrin.h>
 #endif
 
@@ -69,7 +69,7 @@ void WriteBufferValidUTF8::nextImpl()
 
     while (p < pos)
     {
-#if __SSE2__
+#ifdef __SSE2__
         /// Fast skip of ASCII
         static constexpr size_t SIMD_BYTES = 16;
         const char * simd_end = p + (pos - p) / SIMD_BYTES * SIMD_BYTES;
@@ -119,7 +119,7 @@ void WriteBufferValidUTF8::nextImpl()
     for (size_t i = 0; i < cnt; ++i)
         memory[i] = p[i];
 
-    working_buffer = Buffer(&memory[cnt], &memory[0] + memory.size());
+    working_buffer = Buffer(&memory[cnt], memory.data() + memory.size());
 }
 
 

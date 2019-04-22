@@ -1,6 +1,6 @@
 #pragma once
 
-#include <DataStreams/IProfilingBlockInputStream.h>
+#include <DataStreams/IBlockInputStream.h>
 #include <Core/ColumnWithTypeAndName.h>
 
 namespace DB
@@ -9,7 +9,7 @@ namespace DB
 /** Adds a materialized const column to the block with a specified value.
   */
 template <typename T>
-class AddingConstColumnBlockInputStream : public IProfilingBlockInputStream
+class AddingConstColumnBlockInputStream : public IBlockInputStream
 {
 public:
     AddingConstColumnBlockInputStream(
@@ -24,11 +24,11 @@ public:
 
     String getName() const override { return "AddingConstColumn"; }
 
-    String getID() const override
+    Block getHeader() const override
     {
-        std::stringstream res;
-        res << "AddingConstColumn(" << children.back()->getID() << ")";
-        return res.str();
+        Block res = children.back()->getHeader();
+        res.insert({data_type->createColumn(), data_type, column_name});
+        return res;
     }
 
 protected:

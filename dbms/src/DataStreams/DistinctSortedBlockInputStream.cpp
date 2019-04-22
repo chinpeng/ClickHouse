@@ -8,22 +8,14 @@ namespace ErrorCodes
     extern const int SET_SIZE_LIMIT_EXCEEDED;
 }
 
-DistinctSortedBlockInputStream::DistinctSortedBlockInputStream(const BlockInputStreamPtr & input, const Limits & limits, size_t limit_hint_, const Names & columns)
+DistinctSortedBlockInputStream::DistinctSortedBlockInputStream(
+    const BlockInputStreamPtr & input, const SizeLimits & set_size_limits, UInt64 limit_hint_, const Names & columns)
     : description(input->getSortDescription())
     , columns_names(columns)
     , limit_hint(limit_hint_)
-    , max_rows(limits.max_rows_in_distinct)
-    , max_bytes(limits.max_bytes_in_distinct)
-    , overflow_mode(limits.distinct_overflow_mode)
+    , set_size_limits(set_size_limits)
 {
     children.push_back(input);
-}
-
-String DistinctSortedBlockInputStream::getID() const
-{
-    std::stringstream res;
-    res << "DistinctSorted(" << children.back()->getID() << ")";
-    return res.str();
 }
 
 Block DistinctSortedBlockInputStream::readImpl()
@@ -69,25 +61,8 @@ Block DistinctSortedBlockInputStream::readImpl()
         if (!has_new_data)
             continue;
 
-        if (!checkLimits())
-        {
-            switch (overflow_mode)
-            {
-                case OverflowMode::THROW:
-                    throw Exception("DISTINCT-Set size limit exceeded."
-                        " Rows: " + toString(data.getTotalRowCount()) +
-                        ", limit: " + toString(max_rows) +
-                        ". Bytes: " + toString(data.getTotalByteCount()) +
-                        ", limit: " + toString(max_bytes) + ".",
-                        ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);
-
-                case OverflowMode::BREAK:
-                    return Block();
-
-                default:
-                    throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
-            }
-        }
+        if (!set_size_limits.check(data.getTotalRowCount(), data.getTotalByteCount(), "DISTINCT", ErrorCodes::SET_SIZE_LIMIT_EXCEEDED))
+            return {};
 
         prev_block.block = block;
         prev_block.clearing_hint_columns = std::move(clearing_hint_columns);
@@ -100,14 +75,6 @@ Block DistinctSortedBlockInputStream::readImpl()
     }
 }
 
-bool DistinctSortedBlockInputStream::checkLimits() const
-{
-    if (max_rows && data.getTotalRowCount() > max_rows)
-        return false;
-    if (max_bytes && data.getTotalByteCount() > max_bytes)
-        return false;
-    return true;
-}
 
 template <typename Method>
 bool DistinctSortedBlockInputStream::buildFilter(
@@ -118,8 +85,7 @@ bool DistinctSortedBlockInputStream::buildFilter(
     size_t rows,
     ClearableSetVariants & variants) const
 {
-    typename Method::State state;
-    state.init(columns);
+    typename Method::State state(columns, key_sizes, nullptr);
 
     /// Compare last row of previous block and first row of current block,
     /// If rows not equal, we can clear HashSet,
@@ -139,21 +105,14 @@ bool DistinctSortedBlockInputStream::buildFilter(
         if (i > 0 && !clearing_hint_columns.empty() && !rowsEqual(clearing_hint_columns, i, clearing_hint_columns, i - 1))
             method.data.clear();
 
-        /// Make a key.
-        typename Method::Key key = state.getKey(columns, columns.size(), i, key_sizes);
-        typename Method::Data::iterator it = method.data.find(key);
-        bool inserted;
-        method.data.emplace(key, it, inserted);
+        auto emplace_result = state.emplaceKey(method.data, i, variants.string_pool);
 
-        if (inserted)
-        {
-            method.onNewKey(*it, columns.size(), variants.string_pool);
+        if (emplace_result.isInserted())
             has_new_data = true;
-        }
 
         /// Emit the record if there is no such key in the current set yet.
         /// Skip it otherwise.
-        filter[i] = inserted;
+        filter[i] = emplace_result.isInserted();
     }
     return has_new_data;
 }
@@ -183,7 +142,7 @@ ColumnRawPtrs DistinctSortedBlockInputStream::getClearingColumns(const Block & b
 {
     ColumnRawPtrs clearing_hint_columns;
     clearing_hint_columns.reserve(description.size());
-    for(const auto & sort_column_description : description)
+    for (const auto & sort_column_description : description)
     {
         const auto sort_column_ptr = block.safeGetByPosition(sort_column_description.column_number).column.get();
         const auto it = std::find(key_columns.cbegin(), key_columns.cend(), sort_column_ptr);

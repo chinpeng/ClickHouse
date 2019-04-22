@@ -1,8 +1,9 @@
 #pragma once
 
 #include <cmath>
-
 #include <Columns/IColumn.h>
+#include <Columns/ColumnVectorHelper.h>
+#include <common/unaligned.h>
 
 
 namespace DB
@@ -86,46 +87,16 @@ template <> struct CompareHelper<Float32> : public FloatCompareHelper<Float32> {
 template <> struct CompareHelper<Float64> : public FloatCompareHelper<Float64> {};
 
 
-/** To implement `get64` function.
-  */
-template <typename T>
-inline UInt64 unionCastToUInt64(T x) { return x; }
-
-template <> inline UInt64 unionCastToUInt64(Float64 x)
-{
-    union
-    {
-        Float64 src;
-        UInt64 res;
-    };
-
-    src = x;
-    return res;
-}
-
-template <> inline UInt64 unionCastToUInt64(Float32 x)
-{
-    union
-    {
-        Float32 src;
-        UInt64 res;
-    };
-
-    res = 0;
-    src = x;
-    return res;
-}
-
-
 /** A template for columns that use a simple array to store.
-  */
+ */
 template <typename T>
-class ColumnVector final : public COWPtrHelper<IColumn, ColumnVector<T>>
+class ColumnVector final : public COWHelper<ColumnVectorHelper, ColumnVector<T>>
 {
-private:
-    friend class COWPtrHelper<IColumn, ColumnVector<T>>;
+    static_assert(!IsDecimalNumber<T>);
 
-    using Self = ColumnVector<T>;
+private:
+    using Self = ColumnVector;
+    friend class COWHelper<ColumnVectorHelper, Self>;
 
     struct less;
     struct greater;
@@ -138,7 +109,7 @@ private:
     ColumnVector() {}
     ColumnVector(const size_t n) : data(n) {}
     ColumnVector(const size_t n, const value_type x) : data(n, x) {}
-    ColumnVector(const ColumnVector & src) : data(src.data.begin(), src.data.end()) {};
+    ColumnVector(const ColumnVector & src) : data(src.data.begin(), src.data.end()) {}
 
     /// Sugar constructor.
     ColumnVector(std::initializer_list<T> il) : data{il} {}
@@ -163,7 +134,7 @@ public:
 
     void insertData(const char * pos, size_t /*length*/) override
     {
-        data.push_back(*reinterpret_cast<const T *>(pos));
+        data.push_back(unalignedLoad<T>(pos));
     }
 
     void insertDefault() override
@@ -192,7 +163,12 @@ public:
         return data.allocated_bytes();
     }
 
-    void insert(const T value)
+    void protect() override
+    {
+        data.protect();
+    }
+
+    void insertValue(const T value)
     {
         data.push_back(value);
     }
@@ -216,12 +192,12 @@ public:
 
     Field operator[](size_t n) const override
     {
-        return typename NearestFieldType<T>::Type(data[n]);
+        return data[n];
     }
 
     void get(size_t n, Field & res) const override
     {
-        res = typename NearestFieldType<T>::Type(data[n]);
+        res = (*this)[n];
     }
 
     UInt64 get64(size_t n) const override;
@@ -231,6 +207,11 @@ public:
         return UInt64(data[n]);
     }
 
+    bool getBool(size_t n) const override
+    {
+        return bool(data[n]);
+    }
+
     Int64 getInt(size_t n) const override
     {
         return Int64(data[n]);
@@ -238,16 +219,21 @@ public:
 
     void insert(const Field & x) override
     {
-        data.push_back(DB::get<typename NearestFieldType<T>::Type>(x));
+        data.push_back(DB::get<NearestFieldType<T>>(x));
     }
 
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override;
 
-    MutableColumnPtr filter(const IColumn::Filter & filt, ssize_t result_size_hint) const override;
+    ColumnPtr filter(const IColumn::Filter & filt, ssize_t result_size_hint) const override;
 
-    MutableColumnPtr permute(const IColumn::Permutation & perm, size_t limit) const override;
+    ColumnPtr permute(const IColumn::Permutation & perm, size_t limit) const override;
 
-    MutableColumnPtr replicate(const IColumn::Offsets & offsets) const override;
+    ColumnPtr index(const IColumn & indexes, size_t limit) const override;
+
+    template <typename Type>
+    ColumnPtr indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const;
+
+    ColumnPtr replicate(const IColumn::Offsets & offsets) const override;
 
     void getExtremes(Field & min, Field & max) const override;
 
@@ -263,7 +249,13 @@ public:
 
     bool isFixedAndContiguous() const override { return true; }
     size_t sizeOfValueIfFixed() const override { return sizeof(T); }
+    StringRef getRawData() const override { return StringRef(reinterpret_cast<const char*>(data.data()), data.size()); }
 
+
+    bool structureEquals(const IColumn & rhs) const override
+    {
+        return typeid(rhs) == typeid(ColumnVector<T>);
+    }
 
     /** More efficient methods of manipulation - to manipulate with data directly. */
     Container & getData()
@@ -290,5 +282,23 @@ protected:
     Container data;
 };
 
+template <typename T>
+template <typename Type>
+ColumnPtr ColumnVector<T>::indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const
+{
+    size_t size = indexes.size();
+
+    if (limit == 0)
+        limit = size;
+    else
+        limit = std::min(size, limit);
+
+    auto res = this->create(limit);
+    typename Self::Container & res_data = res->getData();
+    for (size_t i = 0; i < limit; ++i)
+        res_data[i] = data[indexes[i]];
+
+    return res;
+}
 
 }

@@ -1,8 +1,10 @@
 #include <Core/NamesAndTypes.h>
 
 #include <Interpreters/Context.h>
+#include <Interpreters/SyntaxAnalyzer.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/IdentifierSemantic.h>
 
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTExpressionList.h>
@@ -14,6 +16,7 @@
 #include <Columns/ColumnsCommon.h>
 
 #include <Storages/VirtualColumnUtils.h>
+#include <IO/WriteHelpers.h>
 #include <Common/typeid_cast.h>
 
 
@@ -73,18 +76,14 @@ String chooseSuffixForSet(const NamesAndTypesList & columns, const std::vector<S
 
 void rewriteEntityInAst(ASTPtr ast, const String & column_name, const Field & value)
 {
-    ASTSelectQuery & select = typeid_cast<ASTSelectQuery &>(*ast);
-    if (!select.with_expression_list)
-    {
-        select.with_expression_list = std::make_shared<ASTExpressionList>();
-        select.children.insert(select.children.begin(), select.with_expression_list);
-    }
+    auto & select = ast->as<ASTSelectQuery &>();
+    if (!select.with())
+        select.setExpression(ASTSelectQuery::Expression::WITH, std::make_shared<ASTExpressionList>());
 
-    ASTExpressionList & with = typeid_cast<ASTExpressionList &>(*select.with_expression_list);
-    auto literal = std::make_shared<ASTLiteral>(StringRange(), value);
+    auto literal = std::make_shared<ASTLiteral>(value);
     literal->alias = column_name;
     literal->prefer_alias_to_column_name = true;
-    with.children.push_back(literal);
+    select.with()->children.push_back(literal);
 }
 
 /// Verifying that the function depends only on the specified columns
@@ -94,18 +93,16 @@ static bool isValidFunction(const ASTPtr & expression, const NameSet & columns)
         if (!isValidFunction(expression->children[i], columns))
             return false;
 
-    if (const ASTIdentifier * identifier = typeid_cast<const ASTIdentifier *>(&*expression))
-    {
-        if (identifier->kind == ASTIdentifier::Kind::Column)
-            return columns.count(identifier->name);
-    }
+    if (auto opt_name = IdentifierSemantic::getColumnName(expression))
+        return columns.count(*opt_name);
+
     return true;
 }
 
 /// Extract all subfunctions of the main conjunction, but depending only on the specified columns
 static void extractFunctions(const ASTPtr & expression, const NameSet & columns, std::vector<ASTPtr> & result)
 {
-    const ASTFunction * function = typeid_cast<const ASTFunction *>(&*expression);
+    const auto * function = expression->as<ASTFunction>();
     if (function && function->name == "and")
     {
         for (size_t i = 0; i < function->arguments->children.size(); ++i)
@@ -125,7 +122,7 @@ static ASTPtr buildWhereExpression(const ASTs & functions)
     if (functions.size() == 1)
         return functions[0];
     ASTPtr new_query = std::make_shared<ASTFunction>();
-    ASTFunction & new_function = typeid_cast<ASTFunction & >(*new_query);
+    auto & new_function = new_query->as<ASTFunction &>();
     new_function.name = "and";
     new_function.arguments = std::make_shared<ASTExpressionList>();
     new_function.arguments->children = functions;
@@ -133,11 +130,11 @@ static ASTPtr buildWhereExpression(const ASTs & functions)
     return new_query;
 }
 
-bool filterBlockWithQuery(const ASTPtr & query, Block & block, const Context & context)
+void filterBlockWithQuery(const ASTPtr & query, Block & block, const Context & context)
 {
-    const ASTSelectQuery & select = typeid_cast<const ASTSelectQuery & >(*query);
-    if (!select.where_expression && !select.prewhere_expression)
-        return false;
+    const auto & select = query->as<ASTSelectQuery &>();
+    if (!select.where() && !select.prewhere())
+        return;
 
     NameSet columns;
     for (const auto & it : block.getNamesAndTypesList())
@@ -145,36 +142,33 @@ bool filterBlockWithQuery(const ASTPtr & query, Block & block, const Context & c
 
     /// We will create an expression that evaluates the expressions in WHERE and PREWHERE, depending only on the existing columns.
     std::vector<ASTPtr> functions;
-    if (select.where_expression)
-        extractFunctions(select.where_expression, columns, functions);
-    if (select.prewhere_expression)
-        extractFunctions(select.prewhere_expression, columns, functions);
+    if (select.where())
+        extractFunctions(select.where(), columns, functions);
+    if (select.prewhere())
+        extractFunctions(select.prewhere(), columns, functions);
+
     ASTPtr expression_ast = buildWhereExpression(functions);
     if (!expression_ast)
-        return false;
+        return;
 
     /// Let's analyze and calculate the expression.
-    ExpressionAnalyzer analyzer(expression_ast, context, {}, block.getNamesAndTypesList());
+    auto syntax_result = SyntaxAnalyzer(context).analyze(expression_ast, block.getNamesAndTypesList());
+    ExpressionAnalyzer analyzer(expression_ast, syntax_result, context);
     ExpressionActionsPtr actions = analyzer.getActions(false);
-    actions->execute(block);
+
+    Block block_with_filter = block;
+    actions->execute(block_with_filter);
 
     /// Filter the block.
     String filter_column_name = expression_ast->getColumnName();
-    ColumnPtr filter_column = block.getByName(filter_column_name).column;
-    if (ColumnPtr converted = filter_column->convertToFullColumnIfConst())
-        filter_column = converted;
+    ColumnPtr filter_column = block_with_filter.getByName(filter_column_name).column->convertToFullColumnIfConst();
     const IColumn::Filter & filter = typeid_cast<const ColumnUInt8 &>(*filter_column).getData();
-
-    if (countBytesInFilter(filter) == 0)
-        return false;
 
     for (size_t i = 0; i < block.columns(); ++i)
     {
         ColumnPtr & column = block.safeGetByPosition(i).column;
         column = column->filter(filter, -1);
     }
-
-    return true;
 }
 
 }

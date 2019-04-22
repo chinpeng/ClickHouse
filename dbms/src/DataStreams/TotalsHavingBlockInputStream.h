@@ -1,10 +1,13 @@
 #pragma once
 
-#include <DataStreams/IProfilingBlockInputStream.h>
+#include <DataStreams/IBlockInputStream.h>
 
 
 namespace DB
 {
+
+class Arena;
+using ArenaPtr = std::shared_ptr<Arena>;
 
 class ExpressionActions;
 
@@ -13,22 +16,23 @@ class ExpressionActions;
   * Calculates total values according to totals_mode.
   * If necessary, evaluates the expression from HAVING and filters rows. Returns the finalized and filtered blocks.
   */
-class TotalsHavingBlockInputStream : public IProfilingBlockInputStream
+class TotalsHavingBlockInputStream : public IBlockInputStream
 {
 private:
     using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 
 public:
+    /// expression may be nullptr
     TotalsHavingBlockInputStream(
         const BlockInputStreamPtr & input_,
         bool overflow_row_, const ExpressionActionsPtr & expression_,
-        const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_);
+        const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_, bool final_);
 
     String getName() const override { return "TotalsHaving"; }
 
-    String getID() const override;
+    Block getTotals() override;
 
-    const Block & getTotals() override;
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;
@@ -39,17 +43,16 @@ private:
     String filter_column_name;
     TotalsMode totals_mode;
     double auto_include_threshold;
+    bool final;
     size_t passed_keys = 0;
     size_t total_keys = 0;
-
-    Block header;
 
     /** Here are the values that did not pass max_rows_to_group_by.
       * They are added or not added to the current_totals, depending on the totals_mode.
       */
     Block overflow_aggregates;
 
-    /// Here, total values are accumulated. After the work is finished, they will be placed in IProfilingBlockInputStream::totals.
+    /// Here, total values are accumulated. After the work is finished, they will be placed in IBlockInputStream::totals.
     MutableColumns current_totals;
     /// Arena for aggregate function states in totals.
     ArenaPtr arena;

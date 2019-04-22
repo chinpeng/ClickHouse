@@ -2,24 +2,19 @@
 
 #include <ext/shared_ptr_helper.h>
 
+#include <Parsers/IAST_fwd.h>
 #include <Storages/IStorage.h>
 
 
 namespace DB
 {
 
-class IAST;
-using ASTPtr = std::shared_ptr<IAST>;
-
-
 class StorageMaterializedView : public ext::shared_ptr_helper<StorageMaterializedView>, public IStorage
 {
 public:
     std::string getName() const override { return "MaterializedView"; }
     std::string getTableName() const override { return table_name; }
-    const NamesAndTypesList & getColumnsListImpl() const override { return columns; }
-    ASTPtr getInnerQuery() const { return inner_query->clone(); };
-    StoragePtr getTargetTable() const;
+    ASTPtr getInnerQuery() const { return inner_query->clone(); }
 
     NameAndTypePair getColumn(const String & column_name) const override;
     bool hasColumn(const String & column_name) const override;
@@ -28,19 +23,41 @@ public:
     bool supportsPrewhere() const override { return getTargetTable()->supportsPrewhere(); }
     bool supportsFinal() const override { return getTargetTable()->supportsFinal(); }
     bool supportsIndexForIn() const override { return getTargetTable()->supportsIndexForIn(); }
+    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const override
+    {
+        return getTargetTable()->mayBenefitFromIndexForIn(left_in_operand, query_context);
+    }
 
-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
+    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
     void drop() override;
+
+    void truncate(const ASTPtr &, const Context &) override;
+
     bool optimize(const ASTPtr & query, const ASTPtr & partition, bool final, bool deduplicate, const Context & context) override;
+
+    void alterPartition(const ASTPtr & query, const PartitionCommands & commands, const Context & context) override;
+
+    void mutate(const MutationCommands & commands, const Context & context) override;
+
     void shutdown() override;
+
+    void checkTableCanBeDropped() const override;
+    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+
+    QueryProcessingStage::Enum getQueryProcessingStage(const Context & context) const override;
+
+    StoragePtr getTargetTable() const;
+    StoragePtr tryGetTargetTable() const;
 
     BlockInputStreams read(
         const Names & column_names,
         const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
+
+    String getDataPath() const override;
 
 private:
     String select_database_name;
@@ -51,8 +68,9 @@ private:
     String database_name;
     ASTPtr inner_query;
     Context & global_context;
-    NamesAndTypesList columns;
     bool has_inner_table = false;
+
+    void checkStatementCanBeForwarded() const;
 
 protected:
     StorageMaterializedView(
@@ -60,10 +78,7 @@ protected:
         const String & database_name_,
         Context & local_context,
         const ASTCreateQuery & query,
-        const NamesAndTypesList & columns_,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
+        const ColumnsDescription & columns_,
         bool attach_);
 };
 

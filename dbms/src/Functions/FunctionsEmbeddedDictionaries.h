@@ -19,12 +19,14 @@
 #include <Dictionaries/Embedded/RegionsHierarchies.h>
 #include <Dictionaries/Embedded/RegionsNames.h>
 
-#include <Common/config.h>
-#include <Common/typeid_cast.h>
-
 #if USE_MYSQL
 #include <Dictionaries/Embedded/TechDataHierarchy.h>
 #endif
+
+#include <IO/WriteHelpers.h>
+
+#include <Common/config.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -34,6 +36,7 @@ namespace ErrorCodes
 {
     extern const int DICTIONARIES_WAS_NOT_LOADED;
     extern const int BAD_ARGUMENTS;
+    extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
@@ -184,7 +187,7 @@ public:
         : owned_dict(owned_dict_)
     {
         if (!owned_dict)
-            throw Exception("Dictionaries was not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
+            throw Exception("Embedded dictionaries were not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
     }
 
     String getName() const override
@@ -218,7 +221,9 @@ public:
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    bool isDeterministic() const override { return false; }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         /// The dictionary key that defines the "point of view".
         std::string dict_key;
@@ -276,7 +281,7 @@ public:
         : owned_dict(owned_dict_)
     {
         if (!owned_dict)
-            throw Exception("Dictionaries was not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
+            throw Exception("Embedded dictionaries were not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
     }
 
     String getName() const override
@@ -312,7 +317,9 @@ public:
         return std::make_shared<DataTypeUInt8>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    bool isDeterministic() const override { return false; }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         /// The dictionary key that defines the "point of view".
         std::string dict_key;
@@ -412,7 +419,7 @@ public:
     : owned_dict(owned_dict_)
     {
         if (!owned_dict)
-            throw Exception("Dictionaries was not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
+            throw Exception("Embedded dictionaries were not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
     }
 
     String getName() const override
@@ -446,7 +453,9 @@ public:
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    bool isDeterministic() const override { return false; }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         /// The dictionary key that defines the "point of view".
         std::string dict_key;
@@ -682,7 +691,7 @@ public:
         : owned_dict(owned_dict_)
     {
         if (!owned_dict)
-            throw Exception("Dictionaries was not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
+            throw Exception("Embedded dictionaries were not loaded. You need to check configuration file.", ErrorCodes::DICTIONARIES_WAS_NOT_LOADED);
     }
 
     String getName() const override
@@ -720,7 +729,9 @@ public:
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    bool isDeterministic() const override { return false; }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         RegionsNames::Language language = RegionsNames::Language::RU;
 
@@ -758,4 +769,4 @@ public:
     }
 };
 
-};
+}

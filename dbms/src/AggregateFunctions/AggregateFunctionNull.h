@@ -31,20 +31,23 @@ class AggregateFunctionNullBase : public IAggregateFunctionHelper<Derived>
 {
 protected:
     AggregateFunctionPtr nested_function;
+    size_t prefix_size;
 
     /** In addition to data for nested aggregate function, we keep a flag
       *  indicating - was there at least one non-NULL value accumulated.
       * In case of no not-NULL values, the function will return NULL.
+      *
+      * We use prefix_size bytes for flag to satisfy the alignment requirement of nested state.
       */
 
-    static AggregateDataPtr nestedPlace(AggregateDataPtr place) noexcept
+    AggregateDataPtr nestedPlace(AggregateDataPtr place) const noexcept
     {
-        return place + (result_is_nullable ? 1 : 0);
+        return place + prefix_size;
     }
 
-    static ConstAggregateDataPtr nestedPlace(ConstAggregateDataPtr place) noexcept
+    ConstAggregateDataPtr nestedPlace(ConstAggregateDataPtr place) const noexcept
     {
-        return place + (result_is_nullable ? 1 : 0);
+        return place + prefix_size;
     }
 
     static void initFlag(AggregateDataPtr place) noexcept
@@ -65,9 +68,13 @@ protected:
     }
 
 public:
-    AggregateFunctionNullBase(AggregateFunctionPtr nested_function_)
-        : nested_function{nested_function_}
+    AggregateFunctionNullBase(AggregateFunctionPtr nested_function_, const DataTypes & arguments, const Array & params)
+        : IAggregateFunctionHelper<Derived>(arguments, params), nested_function{nested_function_}
     {
+        if (result_is_nullable)
+            prefix_size = nested_function->alignOfData();
+        else
+            prefix_size = 0;
     }
 
     String getName() const override
@@ -101,12 +108,12 @@ public:
 
     size_t sizeOfData() const override
     {
-        return 1 + nested_function->sizeOfData();
+        return prefix_size + nested_function->sizeOfData();
     }
 
     size_t alignOfData() const override
     {
-        return 1;    /// NOTE This works fine on x86_64 and ok on AArch64. Doesn't work under UBSan.
+        return nested_function->alignOfData();
     }
 
     void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena * arena) const override
@@ -180,8 +187,8 @@ template <bool result_is_nullable>
 class AggregateFunctionNullUnary final : public AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullUnary<result_is_nullable>>
 {
 public:
-    AggregateFunctionNullUnary(AggregateFunctionPtr nested_function)
-        : AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullUnary<result_is_nullable>>(nested_function)
+    AggregateFunctionNullUnary(AggregateFunctionPtr nested_function_, const DataTypes & arguments, const Array & params)
+        : AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullUnary<result_is_nullable>>(std::move(nested_function_), arguments, params)
     {
     }
 
@@ -202,8 +209,8 @@ template <bool result_is_nullable>
 class AggregateFunctionNullVariadic final : public AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullVariadic<result_is_nullable>>
 {
 public:
-    AggregateFunctionNullVariadic(AggregateFunctionPtr nested_function, const DataTypes & arguments)
-        : AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullVariadic<result_is_nullable>>(nested_function),
+    AggregateFunctionNullVariadic(AggregateFunctionPtr nested_function_, const DataTypes & arguments, const Array & params)
+        : AggregateFunctionNullBase<result_is_nullable, AggregateFunctionNullVariadic<result_is_nullable>>(std::move(nested_function_), arguments, params),
         number_of_arguments(arguments.size())
     {
         if (number_of_arguments == 1)

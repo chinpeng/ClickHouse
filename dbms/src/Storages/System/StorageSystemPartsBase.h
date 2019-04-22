@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ext/shared_ptr_helper.h>
+#include <Formats/FormatSettings.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 
@@ -18,8 +19,6 @@ class StorageSystemPartsBase : public IStorage
 public:
     std::string getTableName() const override { return name; }
 
-    const NamesAndTypesList & getColumnsListImpl() const override { return columns; }
-
     NameAndTypePair getColumn(const String & column_name) const override;
 
     bool hasColumn(const String & column_name) const override;
@@ -28,14 +27,14 @@ public:
             const Names & column_names,
             const SelectQueryInfo & query_info,
             const Context & context,
-            QueryProcessingStage::Enum & processed_stage,
+            QueryProcessingStage::Enum processed_stage,
             size_t max_block_size,
             unsigned num_streams) override;
 
     struct StoragesInfo
     {
         StoragePtr storage;
-        TableStructureReadLockPtr table_lock;
+        TableStructureReadLockHolder table_lock;
 
         String database;
         String table;
@@ -50,12 +49,13 @@ public:
 
 private:
     const std::string name;
-    NamesAndTypesList columns;
 
     bool hasStateColumn(const Names & column_names);
 
 protected:
-    StorageSystemPartsBase(std::string name_, NamesAndTypesList && columns) : name(std::move(name_)), columns(columns) {}
+    const FormatSettings format_settings;
+
+    StorageSystemPartsBase(std::string name_, NamesAndTypesList && columns_);
 
     virtual void processNextStorage(MutableColumns & columns, const StoragesInfo & info, bool has_state_column) = 0;
 };

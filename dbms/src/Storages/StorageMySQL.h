@@ -24,28 +24,36 @@ public:
         mysqlxx::Pool && pool,
         const std::string & remote_database_name,
         const std::string & remote_table_name,
-        const NamesAndTypesList & columns);
+        const bool replace_query,
+        const std::string & on_duplicate_clause,
+        const ColumnsDescription & columns,
+        const Context & context);
 
     std::string getName() const override { return "MySQL"; }
     std::string getTableName() const override { return name; }
-    const NamesAndTypesList & getColumnsListImpl() const override { return columns; }
 
     BlockInputStreams read(
         const Names & column_names,
         const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
 
+    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+
 private:
+    friend class StorageMySQLBlockOutputStream;
     std::string name;
 
     std::string remote_database_name;
     std::string remote_table_name;
+    bool replace_query;
+    std::string on_duplicate_clause;
 
-    NamesAndTypesList columns;
+
     mysqlxx::Pool pool;
+    Context global_context;
 };
 
 }

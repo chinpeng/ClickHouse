@@ -1,6 +1,6 @@
 #include <Parsers/ParserQueryWithOutput.h>
 #include <Parsers/ParserShowTablesQuery.h>
-#include <Parsers/ParserSelectQuery.h>
+#include <Parsers/ParserSelectWithUnionQuery.h>
 #include <Parsers/ParserTablePropertiesQuery.h>
 #include <Parsers/ParserDescribeTableQuery.h>
 #include <Parsers/ParserShowProcesslistQuery.h>
@@ -10,6 +10,9 @@
 #include <Parsers/ParserAlterQuery.h>
 #include <Parsers/ParserDropQuery.h>
 #include <Parsers/ParserKillQueryQuery.h>
+#include <Parsers/ParserOptimizeQuery.h>
+#include <Parsers/ParserSetQuery.h>
+#include <Parsers/ASTExplainQuery.h>
 
 
 namespace DB
@@ -18,7 +21,7 @@ namespace DB
 bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserShowTablesQuery show_tables_p;
-    ParserSelectQuery select_p;
+    ParserSelectWithUnionQuery select_p;
     ParserTablePropertiesQuery table_p;
     ParserDescribeTableQuery describe_table_p;
     ParserShowProcesslistQuery show_processlist_p;
@@ -27,9 +30,21 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     ParserRenameQuery rename_p;
     ParserDropQuery drop_p;
     ParserCheckQuery check_p;
+    ParserOptimizeQuery optimize_p;
     ParserKillQueryQuery kill_query_p;
 
     ASTPtr query;
+
+    ParserKeyword s_ast("AST");
+    ParserKeyword s_analyze("ANALYZE");
+    bool explain_ast = false;
+    bool analyze_syntax = false;
+
+    if (enable_explain && s_ast.ignore(pos, expected))
+        explain_ast = true;
+
+    if (enable_explain && s_analyze.ignore(pos, expected))
+        analyze_syntax = true;
 
     bool parsed = select_p.parse(pos, query, expected)
         || show_tables_p.parse(pos, query, expected)
@@ -41,11 +56,13 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         || rename_p.parse(pos, query, expected)
         || drop_p.parse(pos, query, expected)
         || check_p.parse(pos, query, expected)
-        || kill_query_p.parse(pos, query, expected);
+        || kill_query_p.parse(pos, query, expected)
+        || optimize_p.parse(pos, query, expected);
 
     if (!parsed)
         return false;
 
+    /// FIXME: try to prettify this cast using `as<>()`
     auto & query_with_output = dynamic_cast<ASTQueryWithOutput &>(*query);
 
     ParserKeyword s_into_outfile("INTO OUTFILE");
@@ -66,12 +83,34 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
 
         if (!format_p.parse(pos, query_with_output.format, expected))
             return false;
-        typeid_cast<ASTIdentifier &>(*(query_with_output.format)).kind = ASTIdentifier::Format;
+        setIdentifierSpecial(query_with_output.format);
 
         query_with_output.children.push_back(query_with_output.format);
     }
 
-    node = query;
+    // SETTINGS key1 = value1, key2 = value2, ...
+    ParserKeyword s_settings("SETTINGS");
+    if (s_settings.ignore(pos, expected))
+    {
+        ParserSetQuery parser_settings(true);
+        if (!parser_settings.parse(pos, query_with_output.settings_ast, expected))
+            return false;
+        query_with_output.children.push_back(query_with_output.settings_ast);
+    }
+
+    if (explain_ast)
+    {
+        node = std::make_shared<ASTExplainQuery>(ASTExplainQuery::ParsedAST);
+        node->children.push_back(query);
+    }
+    else if (analyze_syntax)
+    {
+        node = std::make_shared<ASTExplainQuery>(ASTExplainQuery::AnalyzedSyntax);
+        node->children.push_back(query);
+    }
+    else
+        node = query;
+
     return true;
 }
 

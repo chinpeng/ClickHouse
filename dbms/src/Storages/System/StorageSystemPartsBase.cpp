@@ -1,3 +1,4 @@
+#include <Storages/ColumnsDescription.h>
 #include <Storages/System/StorageSystemPartsBase.h>
 #include <Common/escapeForFileName.h>
 #include <Columns/ColumnString.h>
@@ -11,6 +12,7 @@
 #include <Storages/VirtualColumnUtils.h>
 #include <Databases/IDatabase.h>
 #include <Parsers/queryToString.h>
+#include <Parsers/ASTIdentifier.h>
 
 
 namespace DB
@@ -41,7 +43,8 @@ class StoragesInfoStream
 {
 public:
     StoragesInfoStream(const SelectQueryInfo & query_info, const Context & context, bool has_state_column)
-            : has_state_column(has_state_column)
+        : query_id(context.getCurrentQueryId())
+        , has_state_column(has_state_column)
     {
         /// Will apply WHERE to subset of columns and then add more columns.
         /// This is kind of complicated, but we use WHERE to do less work.
@@ -58,16 +61,19 @@ public:
             /// Add column 'database'.
             MutableColumnPtr database_column_mut = ColumnString::create();
             for (const auto & database : databases)
-                database_column_mut->insert(database.first);
+            {
+                if (context.hasDatabaseAccessRights(database.first))
+                    database_column_mut->insert(database.first);
+            }
             block_to_filter.insert(ColumnWithTypeAndName(
-                    std::move(database_column_mut), std::make_shared<DataTypeString>(), "database"));
+                std::move(database_column_mut), std::make_shared<DataTypeString>(), "database"));
 
             /// Filter block_to_filter with column 'database'.
             VirtualColumnUtils::filterBlockWithQuery(query_info.query, block_to_filter, context);
             rows = block_to_filter.rows();
 
             /// Block contains new columns, update database_column.
-            ColumnPtr database_column = block_to_filter.getByName("database").column;
+            ColumnPtr database_column_ = block_to_filter.getByName("database").column;
 
             if (rows)
             {
@@ -77,7 +83,7 @@ public:
 
                 for (size_t i = 0; i < rows; ++i)
                 {
-                    String database_name = (*database_column)[i].get<String>();
+                    String database_name = (*database_column_)[i].get<String>();
                     const DatabasePtr database = databases.at(database_name);
 
                     offsets[i] = i ? offsets[i - 1] : 0;
@@ -113,12 +119,12 @@ public:
             }
         }
 
+        block_to_filter.insert(ColumnWithTypeAndName(std::move(table_column_mut), std::make_shared<DataTypeString>(), "table"));
+        block_to_filter.insert(ColumnWithTypeAndName(std::move(engine_column_mut), std::make_shared<DataTypeString>(), "engine"));
+        block_to_filter.insert(ColumnWithTypeAndName(std::move(active_column_mut), std::make_shared<DataTypeUInt8>(), "active"));
+
         if (rows)
         {
-            block_to_filter.insert(ColumnWithTypeAndName(std::move(table_column_mut), std::make_shared<DataTypeString>(), "table"));
-            block_to_filter.insert(ColumnWithTypeAndName(std::move(engine_column_mut), std::make_shared<DataTypeString>(), "engine"));
-            block_to_filter.insert(ColumnWithTypeAndName(std::move(active_column_mut), std::make_shared<DataTypeUInt8>(), "active"));
-
             /// Filter block_to_filter with columns 'database', 'table', 'engine', 'active'.
             VirtualColumnUtils::filterBlockWithQuery(query_info.query, block_to_filter, context);
             rows = block_to_filter.rows();
@@ -142,10 +148,10 @@ public:
             info.database = (*database_column)[next_row].get<String>();
             info.table = (*table_column)[next_row].get<String>();
 
-            auto isSameTable = [& info, this] (size_t next_row) -> bool
+            auto isSameTable = [&info, this] (size_t row) -> bool
             {
-                return (*database_column)[next_row].get<String>() == info.database &&
-                       (*table_column)[next_row].get<String>() == info.table;
+                return (*database_column)[row].get<String>() == info.database &&
+                       (*table_column)[row].get<String>() == info.table;
             };
 
             /// What 'active' value we need.
@@ -160,8 +166,8 @@ public:
 
             try
             {
-                /// For table not to be dropped.
-                info.table_lock = info.storage->lockStructure(false, __PRETTY_FUNCTION__);
+                /// For table not to be dropped and set of columns to remain constant.
+                info.table_lock = info.storage->lockStructureForShare(false, query_id);
             }
             catch (const Exception & e)
             {
@@ -215,6 +221,8 @@ public:
     }
 
 private:
+    String query_id;
+
     bool has_state_column;
 
     ColumnPtr database_column;
@@ -233,32 +241,30 @@ BlockInputStreams StorageSystemPartsBase::read(
         const Names & column_names,
         const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum /*processed_stage*/,
         const size_t /*max_block_size*/,
         const unsigned /*num_streams*/)
 {
     bool has_state_column = hasStateColumn(column_names);
 
-    processed_stage = QueryProcessingStage::FetchColumns;
-
     StoragesInfoStream stream(query_info, context, has_state_column);
 
     /// Create the result.
 
-    MutableColumns columns = getSampleBlock().cloneEmptyColumns();
+    MutableColumns res_columns = getSampleBlock().cloneEmptyColumns();
     if (has_state_column)
-        columns.push_back(ColumnString::create());
+        res_columns.push_back(ColumnString::create());
 
     while (StoragesInfo info = stream.next())
     {
-        processNextStorage(columns, info, has_state_column);
+        processNextStorage(res_columns, info, has_state_column);
     }
 
     Block block = getSampleBlock();
     if (has_state_column)
         block.insert(ColumnWithTypeAndName(std::make_shared<DataTypeString>(), "_state"));
 
-    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block.cloneWithColumns(std::move(columns))));
+    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block.cloneWithColumns(std::move(res_columns))));
 }
 
 NameAndTypePair StorageSystemPartsBase::getColumn(const String & column_name) const
@@ -275,6 +281,26 @@ bool StorageSystemPartsBase::hasColumn(const String & column_name) const
         return true;
 
     return ITableDeclaration::hasColumn(column_name);
+}
+
+StorageSystemPartsBase::StorageSystemPartsBase(std::string name_, NamesAndTypesList && columns_)
+    : name(std::move(name_))
+{
+    ColumnsDescription columns(std::move(columns_));
+
+    auto add_alias = [&](const String & alias_name, const String & column_name)
+    {
+        ColumnDescription column(alias_name, columns.get(column_name).type);
+        column.default_desc.kind = ColumnDefaultKind::Alias;
+        column.default_desc.expression = std::make_shared<ASTIdentifier>(column_name);
+        columns.add(column);
+    };
+
+    /// Add aliases for old column names for backwards compatibility.
+    add_alias("bytes", "bytes_on_disk");
+    add_alias("marks_size", "marks_bytes");
+
+    setColumns(columns);
 }
 
 }

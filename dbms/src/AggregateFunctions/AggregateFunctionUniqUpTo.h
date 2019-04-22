@@ -1,14 +1,20 @@
 #pragma once
 
 #include <Common/FieldVisitors.h>
+#include <Common/typeid_cast.h>
+
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <AggregateFunctions/UniqVariadicHash.h>
+
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeUUID.h>
+
 #include <Columns/ColumnsNumber.h>
+
 #include <IO/ReadHelpers.h>
-#include <Common/typeid_cast.h>
+#include <IO/WriteHelpers.h>
+
 
 namespace DB
 {
@@ -82,7 +88,7 @@ struct __attribute__((__packed__)) AggregateFunctionUniqUpToData
 
         /// Write values only if the state is not overflowed. Otherwise, they are not needed, and only the fact that the state is overflowed is important.
         if (count <= threshold)
-            wb.write(reinterpret_cast<const char *>(&data[0]), count * sizeof(data[0]));
+            wb.write(reinterpret_cast<const char *>(data), count * sizeof(data[0]));
     }
 
     void read(ReadBuffer & rb, UInt8 threshold)
@@ -90,7 +96,7 @@ struct __attribute__((__packed__)) AggregateFunctionUniqUpToData
         readBinary(count, rb);
 
         if (count <= threshold)
-            rb.read(reinterpret_cast<char *>(&data[0]), count * sizeof(data[0]));
+            rb.read(reinterpret_cast<char *>(data), count * sizeof(data[0]));
     }
 
     void add(const IColumn & column, size_t row_num, UInt8 threshold)
@@ -118,9 +124,7 @@ struct AggregateFunctionUniqUpToData<UInt128> : AggregateFunctionUniqUpToData<UI
     void add(const IColumn & column, size_t row_num, UInt8 threshold)
     {
         UInt128 value = static_cast<const ColumnVector<UInt128> &>(column).getData()[row_num];
-        SipHash hash;
-        hash.update(reinterpret_cast<const char *>(&value), sizeof(value));
-        insert(hash.get64(), threshold);
+        insert(sipHash64(value), threshold);
     }
 };
 
@@ -132,8 +136,9 @@ private:
     UInt8 threshold;
 
 public:
-    AggregateFunctionUniqUpTo(UInt8 threshold)
-        : threshold(threshold)
+    AggregateFunctionUniqUpTo(UInt8 threshold, const DataTypes & argument_types_, const Array & params_)
+        : IAggregateFunctionDataHelper<AggregateFunctionUniqUpToData<T>, AggregateFunctionUniqUpTo<T>>(argument_types_, params_)
+        , threshold(threshold)
     {
     }
 
@@ -182,17 +187,18 @@ public:
   * You can pass multiple arguments as is; You can also pass one argument - a tuple.
   * But (for the possibility of effective implementation), you can not pass several arguments, among which there are tuples.
   */
-template <bool argument_is_tuple>
+template <bool is_exact, bool argument_is_tuple>
 class AggregateFunctionUniqUpToVariadic final
-    : public IAggregateFunctionDataHelper<AggregateFunctionUniqUpToData<UInt64>, AggregateFunctionUniqUpToVariadic<argument_is_tuple>>
+    : public IAggregateFunctionDataHelper<AggregateFunctionUniqUpToData<UInt64>, AggregateFunctionUniqUpToVariadic<is_exact, argument_is_tuple>>
 {
 private:
     size_t num_args = 0;
     UInt8 threshold;
 
 public:
-    AggregateFunctionUniqUpToVariadic(const DataTypes & arguments, UInt8 threshold)
-        : threshold(threshold)
+    AggregateFunctionUniqUpToVariadic(const DataTypes & arguments, const Array & params, UInt8 threshold)
+        : IAggregateFunctionDataHelper<AggregateFunctionUniqUpToData<UInt64>, AggregateFunctionUniqUpToVariadic<is_exact, argument_is_tuple>>(arguments, params)
+        , threshold(threshold)
     {
         if (argument_is_tuple)
             num_args = typeid_cast<const DataTypeTuple &>(*arguments[0]).getElements().size();
@@ -214,7 +220,7 @@ public:
 
     void add(AggregateDataPtr place, const IColumn ** columns, size_t row_num, Arena *) const override
     {
-        this->data(place).insert(UniqVariadicHash<false, argument_is_tuple>::apply(num_args, columns, row_num), threshold);
+        this->data(place).insert(UInt64(UniqVariadicHash<is_exact, argument_is_tuple>::apply(num_args, columns, row_num)), threshold);
     }
 
     void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override

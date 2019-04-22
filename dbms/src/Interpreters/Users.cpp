@@ -1,5 +1,4 @@
 #include <string.h>
-
 #include <Poco/RegularExpression.h>
 #include <Poco/Net/IPAddress.h>
 #include <Poco/Net/SocketAddress.h>
@@ -7,7 +6,6 @@
 #include <Poco/Util/Application.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Poco/String.h>
-
 #include <Common/Exception.h>
 #include <IO/ReadHelpers.h>
 #include <IO/HexWriteBuffer.h>
@@ -16,12 +14,9 @@
 #include <Common/SimpleCache.h>
 #include <Common/StringUtils/StringUtils.h>
 #include <Interpreters/Users.h>
-
-#include <openssl/sha.h>
-
 #include <common/logger_useful.h>
-
 #include <ext/scope_guard.h>
+#include <Common/config.h>
 
 
 namespace DB
@@ -48,14 +43,15 @@ static Poco::Net::IPAddress toIPv6(const Poco::Net::IPAddress addr)
 }
 
 
-/// IP-address or subnet mask. Example: 213.180.204.3 or 10.0.0.1/8 or 2a02:6b8::3 or 2a02:6b8::3/64.
+/// IP-address or subnet mask. Example: 213.180.204.3 or 10.0.0.1/8 or 312.234.1.1/255.255.255.0
+/// 2a02:6b8::3 or 2a02:6b8::3/64 or 2a02:6b8::3/FFFF:FFFF:FFFF:FFFF::
 class IPAddressPattern : public IAddressPattern
 {
 private:
     /// Address of mask. Always transformed to IPv6.
     Poco::Net::IPAddress mask_address;
-    /// Number of bits in mask.
-    UInt8 prefix_bits;
+    /// Mask of net (ip form). Always transformed to IPv6.
+    Poco::Net::IPAddress subnet_mask;
 
 public:
     explicit IPAddressPattern(const String & str)
@@ -69,43 +65,59 @@ public:
         else
         {
             String addr(str, 0, pos - str.c_str());
-            UInt8 prefix_bits_ = parse<UInt8>(pos + 1);
+            auto real_address = Poco::Net::IPAddress(addr);
 
-            construct(Poco::Net::IPAddress(addr), prefix_bits_);
+            String str_mask(str, addr.length() + 1, str.length() - addr.length() - 1);
+            if (isDigits(str_mask))
+            {
+                UInt8 prefix_bits = parse<UInt8>(pos + 1);
+                construct(prefix_bits, real_address.family() == Poco::Net::AddressFamily::IPv4);
+            }
+            else
+            {
+                subnet_mask = netmaskToIPv6(Poco::Net::IPAddress(str_mask));
+            }
+
+            mask_address = toIPv6(real_address);
         }
     }
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
-        return prefixBitsEquals(reinterpret_cast<const char *>(toIPv6(addr).addr()), reinterpret_cast<const char *>(mask_address.addr()), prefix_bits);
+        return prefixBitsEquals(addr, mask_address, subnet_mask);
     }
 
 private:
     void construct(const Poco::Net::IPAddress & mask_address_)
     {
         mask_address = toIPv6(mask_address_);
-        prefix_bits = 128;
+        subnet_mask = Poco::Net::IPAddress(128, Poco::Net::IPAddress::IPv6);
     }
 
-    void construct(const Poco::Net::IPAddress & mask_address_, UInt8 prefix_bits_)
+    void construct(UInt8 prefix_bits, bool is_ipv4)
     {
-        mask_address = toIPv6(mask_address_);
-        prefix_bits = mask_address_.family() == Poco::Net::IPAddress::IPv4
-            ? prefix_bits_ + 96
-            : prefix_bits_;
+        prefix_bits = is_ipv4 ? prefix_bits + 96 : prefix_bits;
+        subnet_mask = Poco::Net::IPAddress(prefix_bits, Poco::Net::IPAddress::IPv6);
     }
 
-    static bool prefixBitsEquals(const char * lhs, const char * rhs, UInt8 prefix_bits)
+    static bool prefixBitsEquals(const Poco::Net::IPAddress & ip_address, const Poco::Net::IPAddress & net_address, const Poco::Net::IPAddress & mask)
     {
-        UInt8 prefix_bytes = prefix_bits / 8;
-        UInt8 remaining_bits = prefix_bits % 8;
+        return ((toIPv6(ip_address) & mask) == (toIPv6(net_address) & mask));
+    }
 
-        return 0 == memcmp(lhs, rhs, prefix_bytes)
-            && (remaining_bits % 8 == 0
-                 || (lhs[prefix_bytes] >> (8 - remaining_bits)) == (rhs[prefix_bytes] >> (8 - remaining_bits)));
+    static bool isDigits(const std::string & str)
+    {
+        return std::all_of(str.begin(), str.end(), isNumericASCII);
+    }
+
+    static Poco::Net::IPAddress netmaskToIPv6(Poco::Net::IPAddress mask)
+    {
+        if (mask.family() == Poco::Net::IPAddress::IPv6)
+            return mask;
+
+        return Poco::Net::IPAddress(96, Poco::Net::IPAddress::IPv6) | toIPv6(mask);
     }
 };
-
 
 /// Check that address equals to one of hostname addresses.
 class HostExactPattern : public IAddressPattern
@@ -237,7 +249,7 @@ bool AddressPatterns::contains(const Poco::Net::IPAddress & addr) const
     return false;
 }
 
-void AddressPatterns::addFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config)
+void AddressPatterns::addFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config)
 {
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_elem, config_keys);
@@ -261,7 +273,7 @@ void AddressPatterns::addFromConfig(const String & config_elem, Poco::Util::Abst
 }
 
 
-User::User(const String & name_, const String & config_elem, Poco::Util::AbstractConfiguration & config)
+User::User(const String & name_, const String & config_elem, const Poco::Util::AbstractConfiguration & config)
     : name(name_)
 {
     bool has_password = config.has(config_elem + ".password");
@@ -301,6 +313,34 @@ User::User(const String & name_, const String & config_elem, Poco::Util::Abstrac
         {
             const auto database_name = config.getString(config_sub_elem + "." + key);
             databases.insert(database_name);
+        }
+    }
+
+    /// Read properties per "database.table"
+    /// Only tables are expected to have properties, so that all the keys inside "database" are table names.
+    const auto config_databases = config_elem + ".databases";
+    if (config.has(config_databases))
+    {
+        Poco::Util::AbstractConfiguration::Keys database_names;
+        config.keys(config_databases, database_names);
+
+        /// Read tables within databases
+        for (const auto & database : database_names)
+        {
+            const auto config_database = config_databases + "." + database;
+            Poco::Util::AbstractConfiguration::Keys table_names;
+            config.keys(config_database, table_names);
+
+            /// Read table properties
+            for (const auto & table : table_names)
+            {
+                const auto config_filter = config_database + "." + table + ".filter";
+                if (config.has(config_filter))
+                {
+                    const auto filter_query = config.getString(config_filter);
+                    table_props[database][table]["filter"] = filter_query;
+                }
+            }
         }
     }
 }

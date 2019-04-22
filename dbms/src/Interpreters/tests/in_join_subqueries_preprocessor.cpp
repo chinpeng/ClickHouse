@@ -6,7 +6,7 @@
 #include <Parsers/queryToString.h>
 #include <Interpreters/InJoinSubqueriesPreprocessor.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/Settings.h>
+#include <Core/Settings.h>
 #include <Storages/IStorage.h>
 #include <Databases/IDatabase.h>
 #include <Databases/DatabaseOrdinary.h>
@@ -38,7 +38,6 @@ public:
     std::string getRemoteTableName() const { return remote_table; }
 
     std::string getTableName() const override { return ""; }
-    const DB::NamesAndTypesList & getColumnsListImpl() const override { return names_and_types; }
 
 protected:
     StorageDistributedFake(const std::string & remote_database_, const std::string & remote_table_, size_t shard_count_)
@@ -50,15 +49,12 @@ private:
     const std::string remote_database;
     const std::string remote_table;
     size_t shard_count;
-    DB::NamesAndTypesList names_and_types;
 };
 
 
-class InJoinSubqueriesPreprocessorMock : public DB::InJoinSubqueriesPreprocessor
+class CheckShardsAndTablesMock : public DB::InJoinSubqueriesPreprocessor::CheckShardsAndTables
 {
 public:
-    using DB::InJoinSubqueriesPreprocessor::InJoinSubqueriesPreprocessor;
-
     bool hasAtLeastTwoShards(const DB::IStorage & table) const override
     {
         if (!table.isRemote())
@@ -1133,7 +1129,7 @@ TestEntries entries =
 };
 
 
-bool performTests(const TestEntries & entries)
+bool run()
 {
     unsigned int count = 0;
     unsigned int i = 1;
@@ -1158,22 +1154,18 @@ bool performTests(const TestEntries & entries)
     return count == entries.size();
 }
 
-bool run()
-{
-    return performTests(entries);
-}
-
-static DB::Context context = DB::Context::createGlobal();
 
 TestResult check(const TestEntry & entry)
 {
+    static DB::Context context = DB::Context::createGlobal();
+
     try
     {
 
         auto storage_distributed_visits = StorageDistributedFake::create("remote_db", "remote_visits", entry.shard_count);
         auto storage_distributed_hits = StorageDistributedFake::create("distant_db", "distant_hits", entry.shard_count);
 
-        DB::DatabasePtr database = std::make_shared<DB::DatabaseOrdinary>("test", "./metadata/test/");
+        DB::DatabasePtr database = std::make_shared<DB::DatabaseOrdinary>("test", "./metadata/test/", context);
         context.addDatabase("test", database);
         database->attachTable("visits_all", storage_distributed_visits);
         database->attachTable("hits_all", storage_distributed_hits);
@@ -1187,13 +1179,11 @@ TestResult check(const TestEntry & entry)
         if (!parse(ast_input, entry.input))
             return TestResult(false, "parse error");
 
-        auto select_query = typeid_cast<DB::ASTSelectQuery *>(&*ast_input);
-
         bool success = true;
 
         try
         {
-            InJoinSubqueriesPreprocessorMock(context).process(select_query);
+            DB::InJoinSubqueriesPreprocessor(context, std::make_unique<CheckShardsAndTablesMock>()).visit(ast_input);
         }
         catch (const DB::Exception & ex)
         {
@@ -1235,7 +1225,7 @@ bool parse(DB::ASTPtr & ast, const std::string & query)
     std::string message;
     auto begin = query.data();
     auto end = begin + query.size();
-    ast = DB::tryParseQuery(parser, begin, end, message, false, "", false);
+    ast = DB::tryParseQuery(parser, begin, end, message, false, "", false, 0);
     return ast != nullptr;
 }
 

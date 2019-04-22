@@ -24,15 +24,11 @@ public:
       */
     BlockIO execute() override;
 
+    std::pair<String, String> getDatabaseTable() const;
+
 private:
-    /// Cache storage to avoid double table function call.
-    StoragePtr cached_table;
-    StoragePtr loadTable();
-
-    StoragePtr getTable();
-
-    Block getSampleBlock();
-
+    StoragePtr getTable(const ASTInsertQuery & query);
+    Block getSampleBlock(const ASTInsertQuery & query, const StoragePtr & table);
     void checkAccess(const ASTInsertQuery & query);
 
     ASTPtr query_ptr;

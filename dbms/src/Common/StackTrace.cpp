@@ -7,22 +7,35 @@
 #include <sstream>
 
 #include <Common/StackTrace.h>
-#include <Common/demangle.h>
+#include <Common/SimpleCache.h>
 
+#include <common/demangle.h>
+
+
+/// Arcadia compatibility DEVTOOLS-3976
+#if defined(BACKTRACE_INCLUDE)
+#include BACKTRACE_INCLUDE
+#endif
+#if !defined(BACKTRACE_FUNC)
+    #define BACKTRACE_FUNC backtrace
+#endif
 
 StackTrace::StackTrace()
 {
-    frames_size = backtrace(frames, STACK_TRACE_MAX_DEPTH);
+    frames_size = BACKTRACE_FUNC(frames.data(), STACK_TRACE_MAX_DEPTH);
+
+    for (size_t i = frames_size; i < STACK_TRACE_MAX_DEPTH; ++i)
+        frames[i] = nullptr;
 }
 
-std::string StackTrace::toString() const
-{
-    char ** symbols = backtrace_symbols(frames, frames_size);
-    std::stringstream res;
 
+std::string StackTrace::toStringImpl(const Frames & frames, size_t frames_size)
+{
+    char ** symbols = backtrace_symbols(frames.data(), frames_size);
     if (!symbols)
         return "Cannot get symbols for stack trace.\n";
 
+    std::stringstream res;
     try
     {
         for (size_t i = 0, size = frames_size; i < size; ++i)
@@ -64,4 +77,14 @@ std::string StackTrace::toString() const
 
     free(symbols);
     return res.str();
+}
+
+
+std::string StackTrace::toString() const
+{
+    /// Calculation of stack trace text is extremely slow.
+    /// We use simple cache because otherwise the server could be overloaded by trash queries.
+
+    static SimpleCache<decltype(StackTrace::toStringImpl), &StackTrace::toStringImpl> func_cached;
+    return func_cached(frames, frames_size);
 }

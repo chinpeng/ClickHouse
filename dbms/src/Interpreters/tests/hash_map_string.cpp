@@ -15,7 +15,7 @@
 #include <Core/Types.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <common/StringRef.h>
 #include <Common/HashTable/HashMap.h>
 #include <Interpreters/AggregationCommon.h>
@@ -69,7 +69,7 @@ namespace ZeroTraits
 
     template <>
     inline void set<CompactStringRef>(CompactStringRef & x) { x.data_mixed = nullptr; }
-};
+}
 
 template <>
 struct DefaultHash<CompactStringRef>
@@ -81,10 +81,13 @@ struct DefaultHash<CompactStringRef>
 };
 
 
-#define mix(h) ({                   \
-    (h) ^= (h) >> 23;               \
-    (h) *= 0x2127599bf4325c37ULL;   \
-    (h) ^= (h) >> 47; })
+static inline UInt64 mix(UInt64 h)
+{
+    h ^= h >> 23;
+    h *= 0x2127599bf4325c37ULL;
+    h ^= h >> 47;
+    return h;
+}
 
 struct FastHash64
 {
@@ -128,11 +131,11 @@ struct FastHash64
 };
 
 
+#if __x86_64__
 struct CrapWow
 {
     size_t operator() (CompactStringRef x) const
     {
-#if __x86_64__
         const char * key = x.data();
         size_t len = x.size;
         size_t seed = 0;
@@ -196,11 +199,9 @@ struct CrapWow
             : "%r12", "%r13", "%r14", "%r15", "cc"
         );
         return hash;
-#else
-        return 0;
-#endif
     }
 };
+#endif
 
 
 struct SimpleHash
@@ -336,8 +337,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(data[i], it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();
@@ -365,8 +366,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(data[i], it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();
@@ -380,6 +381,7 @@ int main(int argc, char ** argv)
             << std::endl;
     }
 
+#if __x86_64__
     if (!m || m == 3)
     {
         Stopwatch watch;
@@ -394,8 +396,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(data[i], it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();
@@ -408,6 +410,7 @@ int main(int argc, char ** argv)
 #endif
             << std::endl;
     }
+#endif
 
     if (!m || m == 4)
     {
@@ -423,8 +426,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(data[i], it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();

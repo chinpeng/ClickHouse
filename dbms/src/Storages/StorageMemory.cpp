@@ -1,11 +1,11 @@
-#include <map>
-
 #include <Common/Exception.h>
 
-#include <DataStreams/IProfilingBlockInputStream.h>
+#include <DataStreams/IBlockInputStream.h>
 
 #include <Storages/StorageMemory.h>
 #include <Storages/StorageFactory.h>
+
+#include <IO/WriteHelpers.h>
 
 
 namespace DB
@@ -17,25 +17,15 @@ namespace ErrorCodes
 }
 
 
-class MemoryBlockInputStream : public IProfilingBlockInputStream
+class MemoryBlockInputStream : public IBlockInputStream
 {
 public:
-    MemoryBlockInputStream(const Names & column_names_, BlocksList::iterator begin_, BlocksList::iterator end_)
-        : column_names(column_names_), begin(begin_), end(end_), it(begin) {}
+    MemoryBlockInputStream(const Names & column_names_, BlocksList::iterator begin_, BlocksList::iterator end_, const StorageMemory & storage_)
+        : column_names(column_names_), begin(begin_), end(end_), it(begin), storage(storage_) {}
 
     String getName() const override { return "Memory"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Memory(" << &*begin << ", " << &*end;
-
-        for (const auto & name : column_names)
-            res << ", " << name;
-
-        res << ")";
-        return res.str();
-    }
+    Block getHeader() const override { return storage.getSampleBlockForColumns(column_names); }
 
 protected:
     Block readImpl() override
@@ -62,6 +52,7 @@ private:
     BlocksList::iterator begin;
     BlocksList::iterator end;
     BlocksList::iterator it;
+    const StorageMemory & storage;
 };
 
 
@@ -70,10 +61,12 @@ class MemoryBlockOutputStream : public IBlockOutputStream
 public:
     explicit MemoryBlockOutputStream(StorageMemory & storage_) : storage(storage_) {}
 
+    Block getHeader() const override { return storage.getSampleBlock(); }
+
     void write(const Block & block) override
     {
         storage.check(block, true);
-        std::lock_guard<std::mutex> lock(storage.mutex);
+        std::lock_guard lock(storage.mutex);
         storage.data.push_back(block);
     }
 private:
@@ -81,14 +74,8 @@ private:
 };
 
 
-StorageMemory::StorageMemory(
-    const std::string & name_,
-    const NamesAndTypesList & columns_,
-    const NamesAndTypesList & materialized_columns_,
-    const NamesAndTypesList & alias_columns_,
-    const ColumnDefaults & column_defaults_)
-    : IStorage{materialized_columns_, alias_columns_, column_defaults_},
-    name(name_), columns(columns_)
+StorageMemory::StorageMemory(String table_name_, ColumnsDescription columns_description_)
+    : IStorage{std::move(columns_description_)}, table_name(std::move(table_name_))
 {
 }
 
@@ -97,14 +84,13 @@ BlockInputStreams StorageMemory::read(
     const Names & column_names,
     const SelectQueryInfo & /*query_info*/,
     const Context & /*context*/,
-    QueryProcessingStage::Enum & processed_stage,
+    QueryProcessingStage::Enum /*processed_stage*/,
     size_t /*max_block_size*/,
     unsigned num_streams)
 {
     check(column_names);
-    processed_stage = QueryProcessingStage::FetchColumns;
 
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard lock(mutex);
 
     size_t size = data.size();
 
@@ -121,7 +107,7 @@ BlockInputStreams StorageMemory::read(
         std::advance(begin, stream * size / num_streams);
         std::advance(end, (stream + 1) * size / num_streams);
 
-        res.push_back(std::make_shared<MemoryBlockInputStream>(column_names, begin, end));
+        res.push_back(std::make_shared<MemoryBlockInputStream>(column_names, begin, end, *this));
     }
 
     return res;
@@ -129,7 +115,7 @@ BlockInputStreams StorageMemory::read(
 
 
 BlockOutputStreamPtr StorageMemory::write(
-    const ASTPtr & /*query*/, const Settings & /*settings*/)
+    const ASTPtr & /*query*/, const Context & /*context*/)
 {
     return std::make_shared<MemoryBlockOutputStream>(*this);
 }
@@ -137,7 +123,13 @@ BlockOutputStreamPtr StorageMemory::write(
 
 void StorageMemory::drop()
 {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard lock(mutex);
+    data.clear();
+}
+
+void StorageMemory::truncate(const ASTPtr &, const Context &)
+{
+    std::lock_guard lock(mutex);
     data.clear();
 }
 
@@ -151,7 +143,7 @@ void registerStorageMemory(StorageFactory & factory)
                 "Engine " + args.engine_name + " doesn't support any arguments (" + toString(args.engine_args.size()) + " given)",
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-        return StorageMemory::create(args.table_name, args.columns, args.materialized_columns, args.alias_columns, args.column_defaults);
+        return StorageMemory::create(args.table_name, args.columns);
     });
 }
 

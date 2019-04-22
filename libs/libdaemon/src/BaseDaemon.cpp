@@ -1,28 +1,18 @@
 #include <daemon/BaseDaemon.h>
-
-#include <Common/ConfigProcessor/ConfigProcessor.h>
-
+#include <daemon/OwnFormattingChannel.h>
+#include <daemon/OwnPatternFormatter.h>
+#include <Common/Config/ConfigProcessor.h>
+#include <daemon/OwnSplitChannel.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/fcntl.h>
 #include <sys/time.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <signal.h>
 #include <cxxabi.h>
 #include <execinfo.h>
-
-#if USE_UNWIND
-    #define UNW_LOCAL_ONLY
-    #include <libunwind.h>
-#endif
-
-#ifdef __APPLE__
-// ucontext is not available without _XOPEN_SOURCE
-#define _XOPEN_SOURCE
-#endif
-#include <ucontext.h>
-
+#include <unistd.h>
 #include <typeinfo>
 #include <common/logger_useful.h>
 #include <common/ErrorHandlers.h>
@@ -35,10 +25,7 @@
 #include <Poco/Observer.h>
 #include <Poco/Logger.h>
 #include <Poco/AutoPtr.h>
-#include <Poco/SplitterChannel.h>
-#include <Poco/Ext/LevelFilterChannel.h>
-#include <Poco/Ext/ThreadNumber.h>
-#include <Poco/FormattingChannel.h>
+#include <common/getThreadNumber.h>
 #include <Poco/PatternFormatter.h>
 #include <Poco/ConsoleChannel.h>
 #include <Poco/TaskManager.h>
@@ -47,12 +34,13 @@
 #include <Poco/Message.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Poco/Util/XMLConfiguration.h>
-#include <Poco/ScopedLock.h>
+#include <Poco/Util/MapConfiguration.h>
+#include <Poco/Util/Application.h>
 #include <Poco/Exception.h>
 #include <Poco/ErrorHandler.h>
-#include <Poco/NumberFormatter.h>
 #include <Poco/Condition.h>
 #include <Poco/SyslogChannel.h>
+#include <Poco/DirectoryIterator.h>
 #include <Common/Exception.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
 #include <IO/ReadBufferFromFileDescriptor.h>
@@ -60,21 +48,22 @@
 #include <IO/WriteHelpers.h>
 #include <Common/getMultipleKeysFromConfig.h>
 #include <Common/ClickHouseRevision.h>
+#include <Common/config_version.h>
 #include <daemon/OwnPatternFormatter.h>
+#include <Common/CurrentThread.h>
+#include <Poco/Net/RemoteSyslogChannel.h>
 
-using Poco::Logger;
-using Poco::AutoPtr;
-using Poco::Observer;
-using Poco::FormattingChannel;
-using Poco::SplitterChannel;
-using Poco::ConsoleChannel;
-using Poco::FileChannel;
-using Poco::Path;
-using Poco::Message;
-using Poco::Util::AbstractConfiguration;
+#if USE_UNWIND
+    #define UNW_LOCAL_ONLY
+    #include <libunwind.h>
+#endif
 
+#ifdef __APPLE__
+// ucontext is not available without _XOPEN_SOURCE
+#define _XOPEN_SOURCE
+#endif
+#include <ucontext.h>
 
-constexpr char BaseDaemon::DEFAULT_GRAPHITE_CONFIG_NAME[];
 
 /** For transferring information from signal handler to a separate thread.
   * If you need to do something serious in case of a signal (example: write a message to the log),
@@ -100,7 +89,7 @@ struct Pipe
         write_fd = -1;
 
         if (0 != pipe(fds))
-            DB::throwFromErrno("Cannot create pipe");
+            DB::throwFromErrno("Cannot create pipe", 0);
     }
 
     void close()
@@ -134,11 +123,11 @@ Pipe signal_pipe;
 static void call_default_signal_handler(int sig)
 {
     signal(sig, SIG_DFL);
-    kill(getpid(), sig);
+    raise(sig);
 }
 
 
-using ThreadNumber = decltype(Poco::ThreadNumber::get());
+using ThreadNumber = decltype(getThreadNumber());
 static const size_t buf_size = sizeof(int) + sizeof(siginfo_t) + sizeof(ucontext_t) + sizeof(ThreadNumber);
 
 using signal_function = void(int, siginfo_t*, void*);
@@ -179,7 +168,7 @@ static void faultSignalHandler(int sig, siginfo_t * info, void * context)
     DB::writeBinary(sig, out);
     DB::writePODBinary(*info, out);
     DB::writePODBinary(*reinterpret_cast<const ucontext_t *>(context), out);
-    DB::writeBinary(Poco::ThreadNumber::get(), out);
+    DB::writeBinary(getThreadNumber(), out);
 
     out.next();
 
@@ -190,14 +179,23 @@ static void faultSignalHandler(int sig, siginfo_t * info, void * context)
 }
 
 
-static bool already_printed_stack_trace = false;
-
 #if USE_UNWIND
-size_t backtraceLibUnwind(void ** out_frames, size_t max_frames, ucontext_t & context)
+/** We suppress the following ASan report. Also shown by Valgrind.
+==124==ERROR: AddressSanitizer: stack-use-after-scope on address 0x7f054be57000 at pc 0x0000068b0649 bp 0x7f060eeac590 sp 0x7f060eeabd40
+READ of size 1 at 0x7f054be57000 thread T3
+    #0 0x68b0648 in write (/usr/bin/clickhouse+0x68b0648)
+    #1 0x717da02 in write_validate /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/x86_64/Ginit.c:110:13
+    #2 0x717da02 in mincore_validate /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/x86_64/Ginit.c:146
+    #3 0x717dec1 in validate_mem /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/x86_64/Ginit.c:206:7
+    #4 0x717dec1 in access_mem /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/x86_64/Ginit.c:240
+    #5 0x71881a9 in dwarf_get /build/obj-x86_64-linux-gnu/../contrib/libunwind/include/tdep-x86_64/libunwind_i.h:168:12
+    #6 0x71881a9 in apply_reg_state /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/dwarf/Gparser.c:872
+    #7 0x718705c in _ULx86_64_dwarf_step /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/dwarf/Gparser.c:953:10
+    #8 0x718f155 in _ULx86_64_step /build/obj-x86_64-linux-gnu/../contrib/libunwind/src/x86_64/Gstep.c:71:9
+    #9 0x7162671 in backtraceLibUnwind(void**, unsigned long, ucontext_t&) /build/obj-x86_64-linux-gnu/../libs/libdaemon/src/BaseDaemon.cpp:202:14
+  */
+size_t NO_SANITIZE_ADDRESS backtraceLibUnwind(void ** out_frames, size_t max_frames, ucontext_t & context)
 {
-    if (already_printed_stack_trace)
-        return 0;
-
     unw_cursor_t cursor;
 
     if (unw_init_local2(&cursor, &context, UNW_INIT_SIGNAL_FRAME) < 0)
@@ -300,27 +298,14 @@ private:
 private:
     void onTerminate(const std::string & message, ThreadNumber thread_num) const
     {
-        LOG_ERROR(log, "(from thread " << thread_num << ") " << message);
+        LOG_ERROR(log, "(version " << VERSION_STRING << VERSION_OFFICIAL << ") (from thread " << thread_num << ") " << message);
     }
 
     void onFault(int sig, siginfo_t & info, ucontext_t & context, ThreadNumber thread_num) const
     {
         LOG_ERROR(log, "########################################");
-        LOG_ERROR(log, "(from thread " << thread_num << ") "
+        LOG_ERROR(log, "(version " << VERSION_STRING << VERSION_OFFICIAL << ") (from thread " << thread_num << ") "
             << "Received signal " << strsignal(sig) << " (" << sig << ")" << ".");
-
-        if (sig == SIGSEGV)
-        {
-            /// Print info about address and reason.
-            if (nullptr == info.si_addr)
-                LOG_ERROR(log, "Address: NULL pointer.");
-            else
-                LOG_ERROR(log, "Address: " << info.si_addr
-                    << (info.si_code == SEGV_ACCERR ? ". Attempted access has violated the permissions assigned to the memory area." : ""));
-        }
-
-        if (already_printed_stack_trace)
-            return;
 
         void * caller_address = nullptr;
 
@@ -332,10 +317,147 @@ private:
         caller_address = reinterpret_cast<void *>(context.uc_mcontext->__ss.__rip);
         #else
         caller_address = reinterpret_cast<void *>(context.uc_mcontext.gregs[REG_RIP]);
+        auto err_mask = context.uc_mcontext.gregs[REG_ERR];
         #endif
 #elif defined(__aarch64__)
         caller_address = reinterpret_cast<void *>(context.uc_mcontext.pc);
 #endif
+
+        switch (sig)
+        {
+            case SIGSEGV:
+            {
+                /// Print info about address and reason.
+                if (nullptr == info.si_addr)
+                    LOG_ERROR(log, "Address: NULL pointer.");
+                else
+                    LOG_ERROR(log, "Address: " << info.si_addr);
+
+#if defined(__x86_64__) && !defined(__FreeBSD__) && !defined(__APPLE__)
+                if ((err_mask & 0x02))
+                    LOG_ERROR(log, "Access: write.");
+                else
+                    LOG_ERROR(log, "Access: read.");
+#endif
+
+                switch (info.si_code)
+                {
+                    case SEGV_ACCERR:
+                        LOG_ERROR(log, "Attempted access has violated the permissions assigned to the memory area.");
+                        break;
+                    case SEGV_MAPERR:
+                        LOG_ERROR(log, "Address not mapped to object.");
+                        break;
+                    default:
+                        LOG_ERROR(log, "Unknown si_code.");
+                        break;
+                }
+                break;
+            }
+
+            case SIGBUS:
+            {
+                switch (info.si_code)
+                {
+                    case BUS_ADRALN:
+                        LOG_ERROR(log, "Invalid address alignment.");
+                        break;
+                    case BUS_ADRERR:
+                        LOG_ERROR(log, "Non-existant physical address.");
+                        break;
+                    case BUS_OBJERR:
+                        LOG_ERROR(log, "Object specific hardware error.");
+                        break;
+
+                    // Linux specific
+#if defined(BUS_MCEERR_AR)
+                    case BUS_MCEERR_AR:
+                        LOG_ERROR(log, "Hardware memory error: action required.");
+                        break;
+#endif
+#if defined(BUS_MCEERR_AO)
+                    case BUS_MCEERR_AO:
+                        LOG_ERROR(log, "Hardware memory error: action optional.");
+                        break;
+#endif
+
+                    default:
+                        LOG_ERROR(log, "Unknown si_code.");
+                        break;
+                }
+                break;
+            }
+
+            case SIGILL:
+            {
+                switch (info.si_code)
+                {
+                    case ILL_ILLOPC:
+                        LOG_ERROR(log, "Illegal opcode.");
+                        break;
+                    case ILL_ILLOPN:
+                        LOG_ERROR(log, "Illegal operand.");
+                        break;
+                    case ILL_ILLADR:
+                        LOG_ERROR(log, "Illegal addressing mode.");
+                        break;
+                    case ILL_ILLTRP:
+                        LOG_ERROR(log, "Illegal trap.");
+                        break;
+                    case ILL_PRVOPC:
+                        LOG_ERROR(log, "Privileged opcode.");
+                        break;
+                    case ILL_PRVREG:
+                        LOG_ERROR(log, "Privileged register.");
+                        break;
+                    case ILL_COPROC:
+                        LOG_ERROR(log, "Coprocessor error.");
+                        break;
+                    case ILL_BADSTK:
+                        LOG_ERROR(log, "Internal stack error.");
+                        break;
+                    default:
+                        LOG_ERROR(log, "Unknown si_code.");
+                        break;
+                }
+                break;
+            }
+
+            case SIGFPE:
+            {
+                switch (info.si_code)
+                {
+                    case FPE_INTDIV:
+                        LOG_ERROR(log, "Integer divide by zero.");
+                        break;
+                    case FPE_INTOVF:
+                        LOG_ERROR(log, "Integer overflow.");
+                        break;
+                    case FPE_FLTDIV:
+                        LOG_ERROR(log, "Floating point divide by zero.");
+                        break;
+                    case FPE_FLTOVF:
+                        LOG_ERROR(log, "Floating point overflow.");
+                        break;
+                    case FPE_FLTUND:
+                        LOG_ERROR(log, "Floating point underflow.");
+                        break;
+                    case FPE_FLTRES:
+                        LOG_ERROR(log, "Floating point inexact result.");
+                        break;
+                    case FPE_FLTINV:
+                        LOG_ERROR(log, "Floating point invalid operation.");
+                        break;
+                    case FPE_FLTSUB:
+                        LOG_ERROR(log, "Subscript out of range.");
+                        break;
+                    default:
+                        LOG_ERROR(log, "Unknown si_code.");
+                        break;
+                }
+                break;
+            }
+        }
 
         static const int max_frames = 50;
         void * frames[max_frames];
@@ -417,58 +539,15 @@ static void terminate_handler()
 
     terminating = true;
 
-    std::stringstream log;
+    std::string log_message;
 
-    std::type_info * t = abi::__cxa_current_exception_type();
-    if (t)
-    {
-        /// Note that "name" is the mangled name.
-        char const * name = t->name();
-        {
-            int status = -1;
-            char * dem = 0;
-
-            dem = abi::__cxa_demangle(name, 0, 0, &status);
-
-            log << "Terminate called after throwing an instance of " << (status == 0 ? dem : name) << std::endl;
-
-            if (status == 0)
-                free(dem);
-        }
-
-        already_printed_stack_trace = true;
-
-        /// If the exception is derived from std::exception, we can give more information.
-        try
-        {
-            throw;
-        }
-        catch (DB::Exception & e)
-        {
-            log << "Code: " << e.code() << ", e.displayText() = " << e.displayText() << ", e.what() = " << e.what() << std::endl;
-        }
-        catch (Poco::Exception & e)
-        {
-            log << "Code: " << e.code() << ", e.displayText() = " << e.displayText() << ", e.what() = " << e.what() << std::endl;
-        }
-        catch (const std::exception & e)
-        {
-            log << "what(): " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-        }
-
-        log << "Stack trace:\n\n" << StackTrace().toString() << std::endl;
-    }
+    if (std::current_exception())
+        log_message = "Terminate called for uncaught exception:\n" + DB::getCurrentExceptionMessage(true);
     else
-    {
-        log << "Terminate called without an active exception" << std::endl;
-    }
+        log_message = "Terminate called without an active exception";
 
     static const size_t buf_size = 1024;
 
-    std::string log_message = log.str();
     if (log_message.size() > buf_size - 16)
         log_message.resize(buf_size - 16);
 
@@ -476,7 +555,7 @@ static void terminate_handler()
     DB::WriteBufferFromFileDescriptor out(signal_pipe.write_fd, buf_size, buf);
 
     DB::writeBinary(static_cast<int>(SignalListener::StdTerminate), out);
-    DB::writeBinary(Poco::ThreadNumber::get(), out);
+    DB::writeBinary(getThreadNumber(), out);
     DB::writeBinary(log_message, out);
     out.next();
 
@@ -484,23 +563,13 @@ static void terminate_handler()
 }
 
 
-static std::string createDirectory(const std::string & _path)
+static std::string createDirectory(const std::string & file)
 {
-    Poco::Path path(_path);
-    std::string str;
-    for(int j=0;j<path.depth();++j)
-    {
-        str += "/";
-        str += path[j];
-
-        int res = ::mkdir(str.c_str(), 0700);
-        if( res && (errno!=EEXIST) )
-        {
-            throw std::runtime_error(std::string("Can't create dir - ") + str + " - " + strerror(errno));
-        }
-    }
-
-    return str;
+    auto path = Poco::Path(file).makeParent();
+    if (path.toString().empty())
+        return "";
+    Poco::File(path).createDirectories();
+    return path.toString();
 };
 
 static bool tryCreateDirectories(Poco::Logger * logger, const std::string & path)
@@ -527,7 +596,10 @@ void BaseDaemon::reloadConfiguration()
       * (It's convenient to log in console when you start server without any command line parameters.)
       */
     config_path = config().getString("config-file", "config.xml");
-    loaded_config = ConfigProcessor(config_path, false, true).loadConfig(/* allow_zk_includes = */ true);
+    DB::ConfigProcessor config_processor(config_path, false, true);
+    config_processor.setConfigPath(Poco::Path(config_path).makeParent().toString());
+    loaded_config = config_processor.loadConfig(/* allow_zk_includes = */ true);
+
     if (last_configuration != nullptr)
         config().removeConfiguration(last_configuration);
     last_configuration = loaded_config.configuration.duplicate();
@@ -535,8 +607,10 @@ void BaseDaemon::reloadConfiguration()
 }
 
 
-/// For creating and destroying unique_ptr of incomplete type.
-BaseDaemon::BaseDaemon() = default;
+BaseDaemon::BaseDaemon()
+{
+    checkRequiredInstructions();
+}
 
 
 BaseDaemon::~BaseDaemon()
@@ -547,19 +621,139 @@ BaseDaemon::~BaseDaemon()
 }
 
 
+enum class InstructionFail
+{
+    NONE = 0,
+    SSE3 = 1,
+    SSSE3 = 2,
+    SSE4_1 = 3,
+    SSE4_2 = 4,
+    AVX = 5,
+    AVX2 = 6,
+    AVX512 = 7
+};
+
+static std::string instructionFailToString(InstructionFail fail)
+{
+    switch(fail)
+    {
+        case InstructionFail::NONE:
+            return "NONE";
+        case InstructionFail::SSE3:
+            return "SSE3";
+        case InstructionFail::SSSE3:
+            return "SSSE3";
+        case InstructionFail::SSE4_1:
+            return "SSE4.1";
+        case InstructionFail::SSE4_2:
+            return "SSE4.2";
+        case InstructionFail::AVX:
+            return "AVX";
+        case InstructionFail::AVX2:
+            return "AVX2";
+        case InstructionFail::AVX512:
+            return "AVX512";
+    }
+    __builtin_unreachable();
+}
+
+
+static sigjmp_buf jmpbuf;
+
+static void sigIllCheckHandler(int sig, siginfo_t * info, void * context)
+{
+    siglongjmp(jmpbuf, 1);
+}
+
+/// Check if necessary sse extensions are available by trying to execute some sse instructions.
+/// If instruction is unavailable, SIGILL will be sent by kernel.
+static void checkRequiredInstructions(volatile InstructionFail & fail)
+{
+#if __SSE3__
+    fail = InstructionFail::SSE3;
+    __asm__ volatile ("addsubpd %%xmm0, %%xmm0" : : : "xmm0");
+#endif
+
+#if __SSSE3__
+    fail = InstructionFail::SSSE3;
+    __asm__ volatile ("pabsw %%xmm0, %%xmm0" : : : "xmm0");
+
+#endif
+
+#if __SSE4_1__
+    fail = InstructionFail::SSE4_1;
+    __asm__ volatile ("pmaxud %%xmm0, %%xmm0" : : : "xmm0");
+#endif
+
+#if __SSE4_2__
+    fail = InstructionFail::SSE4_2;
+    __asm__ volatile ("pcmpgtq %%xmm0, %%xmm0" : : : "xmm0");
+#endif
+
+#if __AVX__
+    fail = InstructionFail::AVX;
+    __asm__ volatile ("vaddpd %%ymm0, %%ymm0, %%ymm0" : : : "ymm0");
+#endif
+
+#if __AVX2__
+    fail = InstructionFail::AVX2;
+    __asm__ volatile ("vpabsw %%ymm0, %%ymm0" : : : "ymm0");
+#endif
+
+#if __AVX512__
+    fail = InstructionFail::AVX512;
+    __asm__ volatile ("vpabsw %%zmm0, %%zmm0" : : : "zmm0");
+#endif
+
+    fail = InstructionFail::NONE;
+}
+
+
+void BaseDaemon::checkRequiredInstructions()
+{
+    struct sigaction sa{};
+    struct sigaction sa_old{};
+    sa.sa_sigaction = sigIllCheckHandler;
+    sa.sa_flags = SA_SIGINFO;
+    auto signal = SIGILL;
+    if (sigemptyset(&sa.sa_mask) != 0
+        || sigaddset(&sa.sa_mask, signal) != 0
+        || sigaction(signal, &sa, &sa_old) != 0)
+    {
+        std::cerr << "Can not set signal handler\n";
+        exit(1);
+    }
+
+    volatile InstructionFail fail = InstructionFail::NONE;
+
+    if (sigsetjmp(jmpbuf, 1))
+    {
+        std::cerr << "Instruction check fail. There is no " << instructionFailToString(fail) << " instruction set\n";
+        exit(1);
+    }
+
+    ::checkRequiredInstructions(fail);
+
+    if (sigaction(signal, &sa_old, nullptr))
+    {
+        std::cerr << "Can not set signal handler\n";
+        exit(1);
+    }
+}
+
+
 void BaseDaemon::terminate()
 {
     getTaskManager().cancelAll();
-    if (::kill(Poco::Process::id(), SIGTERM) != 0)
-    {
+    if (::raise(SIGTERM) != 0)
         throw Poco::SystemException("cannot terminate process");
-    }
 }
 
 void BaseDaemon::kill()
 {
     pid.clear();
-    Poco::Process::kill(getpid());
+    if (::raise(SIGKILL) != 0)
+        throw Poco::SystemException("cannot kill process");
 }
 
 void BaseDaemon::sleep(double seconds)
@@ -574,95 +768,104 @@ void BaseDaemon::wakeup()
 }
 
 
-void BaseDaemon::buildLoggers()
+void BaseDaemon::buildLoggers(Poco::Util::AbstractConfiguration & config)
 {
-    bool is_daemon = config().getBool("application.runAsDaemon", false);
+    auto current_logger = config.getString("logger");
+    if (config_logger == current_logger)
+        return;
+    config_logger = current_logger;
 
-    /// Change path for logging.
-    if (config().hasProperty("logger.log"))
-    {
-        std::string path = createDirectory(config().getString("logger.log"));
-        if (is_daemon
-            && chdir(path.c_str()) != 0)
-            throw Poco::Exception("Cannot change directory to " + path);
-    }
-    else
-    {
-        if (is_daemon
-            && chdir("/tmp") != 0)
-            throw Poco::Exception("Cannot change directory to /tmp");
-    }
+    bool is_daemon = config.getBool("application.runAsDaemon", false);
 
-    // Split log and error log.
-    Poco::AutoPtr<SplitterChannel> split = new SplitterChannel;
+    /// Split logs to ordinary log, error log, syslog and console.
+    /// Use extended interface of Channel for more comprehensive logging.
+    Poco::AutoPtr<DB::OwnSplitChannel> split = new DB::OwnSplitChannel;
 
-    if (config().hasProperty("logger.log"))
+    auto log_level = config.getString("logger.level", "trace");
+    const auto log_path = config.getString("logger.log", "");
+    if (!log_path.empty())
     {
-        createDirectory(config().getString("logger.log"));
-        std::cerr << "Should logs to " << config().getString("logger.log") << std::endl;
+        createDirectory(log_path);
+        std::cerr << "Logging " << log_level << " to " << log_path << std::endl;
 
         // Set up two channel chains.
-        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this);
-        pf->setProperty("times", "local");
-        Poco::AutoPtr<FormattingChannel> log = new FormattingChannel(pf);
-        log_file = new FileChannel;
-        log_file->setProperty(Poco::FileChannel::PROP_PATH, Poco::Path(config().getString("logger.log")).absolute().toString());
-        log_file->setProperty(Poco::FileChannel::PROP_ROTATION, config().getRawString("logger.size", "100M"));
+        log_file = new Poco::FileChannel;
+        log_file->setProperty(Poco::FileChannel::PROP_PATH, Poco::Path(log_path).absolute().toString());
+        log_file->setProperty(Poco::FileChannel::PROP_ROTATION, config.getRawString("logger.size", "100M"));
         log_file->setProperty(Poco::FileChannel::PROP_ARCHIVE, "number");
-        log_file->setProperty(Poco::FileChannel::PROP_COMPRESS, config().getRawString("logger.compress", "true"));
-        log_file->setProperty(Poco::FileChannel::PROP_PURGECOUNT, config().getRawString("logger.count", "1"));
-        log_file->setProperty(Poco::FileChannel::PROP_FLUSH, config().getRawString("logger.flush", "true"));
-        log_file->setProperty(Poco::FileChannel::PROP_ROTATEONOPEN, config().getRawString("logger.rotateOnOpen", "false"));
-        log->setChannel(log_file);
-        split->addChannel(log);
+        log_file->setProperty(Poco::FileChannel::PROP_COMPRESS, config.getRawString("logger.compress", "true"));
+        log_file->setProperty(Poco::FileChannel::PROP_PURGECOUNT, config.getRawString("logger.count", "1"));
+        log_file->setProperty(Poco::FileChannel::PROP_FLUSH, config.getRawString("logger.flush", "true"));
+        log_file->setProperty(Poco::FileChannel::PROP_ROTATEONOPEN, config.getRawString("logger.rotateOnOpen", "false"));
         log_file->open();
+
+        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this);
+
+        Poco::AutoPtr<DB::OwnFormattingChannel> log = new DB::OwnFormattingChannel(pf, log_file);
+        split->addChannel(log);
     }
 
-    if (config().hasProperty("logger.errorlog"))
+    const auto errorlog_path = config.getString("logger.errorlog", "");
+    if (!errorlog_path.empty())
     {
-        createDirectory(config().getString("logger.errorlog"));
-        std::cerr << "Should error logs to " << config().getString("logger.errorlog") << std::endl;
-        Poco::AutoPtr<Poco::LevelFilterChannel> level = new Poco::LevelFilterChannel;
-        level->setLevel(Message::PRIO_NOTICE);
-        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this);
-        pf->setProperty("times", "local");
-        Poco::AutoPtr<FormattingChannel> errorlog = new FormattingChannel(pf);
-        error_log_file = new FileChannel;
-        error_log_file->setProperty(Poco::FileChannel::PROP_PATH, Poco::Path(config().getString("logger.errorlog")).absolute().toString());
-        error_log_file->setProperty(Poco::FileChannel::PROP_ROTATION, config().getRawString("logger.size", "100M"));
+        createDirectory(errorlog_path);
+        std::cerr << "Logging errors to " << errorlog_path << std::endl;
+
+        error_log_file = new Poco::FileChannel;
+        error_log_file->setProperty(Poco::FileChannel::PROP_PATH, Poco::Path(errorlog_path).absolute().toString());
+        error_log_file->setProperty(Poco::FileChannel::PROP_ROTATION, config.getRawString("logger.size", "100M"));
         error_log_file->setProperty(Poco::FileChannel::PROP_ARCHIVE, "number");
-        error_log_file->setProperty(Poco::FileChannel::PROP_COMPRESS, config().getRawString("logger.compress", "true"));
-        error_log_file->setProperty(Poco::FileChannel::PROP_PURGECOUNT, config().getRawString("logger.count", "1"));
-        error_log_file->setProperty(Poco::FileChannel::PROP_FLUSH, config().getRawString("logger.flush", "true"));
-        error_log_file->setProperty(Poco::FileChannel::PROP_ROTATEONOPEN, config().getRawString("logger.rotateOnOpen", "false"));
-        errorlog->setChannel(error_log_file);
-        level->setChannel(errorlog);
-        split->addChannel(level);
+        error_log_file->setProperty(Poco::FileChannel::PROP_COMPRESS, config.getRawString("logger.compress", "true"));
+        error_log_file->setProperty(Poco::FileChannel::PROP_PURGECOUNT, config.getRawString("logger.count", "1"));
+        error_log_file->setProperty(Poco::FileChannel::PROP_FLUSH, config.getRawString("logger.flush", "true"));
+        error_log_file->setProperty(Poco::FileChannel::PROP_ROTATEONOPEN, config.getRawString("logger.rotateOnOpen", "false"));
+
+        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this);
+
+        Poco::AutoPtr<DB::OwnFormattingChannel> errorlog = new DB::OwnFormattingChannel(pf, error_log_file);
+        errorlog->setLevel(Poco::Message::PRIO_NOTICE);
         errorlog->open();
+        split->addChannel(errorlog);
     }
 
     /// "dynamic_layer_selection" is needed only for Yandex.Metrika, that share part of ClickHouse code.
     /// We don't need this configuration parameter.
 
-    if (config().getBool("logger.use_syslog", false) || config().getBool("dynamic_layer_selection", false))
+    if (config.getBool("logger.use_syslog", false) || config.getBool("dynamic_layer_selection", false))
     {
-        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this, OwnPatternFormatter::ADD_LAYER_TAG);
-        pf->setProperty("times", "local");
-        Poco::AutoPtr<FormattingChannel> log = new FormattingChannel(pf);
-        syslog_channel = new Poco::SyslogChannel(commandName(), Poco::SyslogChannel::SYSLOG_CONS | Poco::SyslogChannel::SYSLOG_PID, Poco::SyslogChannel::SYSLOG_DAEMON);
-        log->setChannel(syslog_channel);
-        split->addChannel(log);
+        const std::string & cmd_name = commandName();
+
+        if (config.has("logger.syslog.address"))
+        {
+            syslog_channel = new Poco::Net::RemoteSyslogChannel();
+            // syslog address
+            syslog_channel->setProperty(Poco::Net::RemoteSyslogChannel::PROP_LOGHOST, config.getString("logger.syslog.address"));
+            if (config.has("logger.syslog.hostname"))
+            {
+                syslog_channel->setProperty(Poco::Net::RemoteSyslogChannel::PROP_HOST, config.getString("logger.syslog.hostname"));
+            }
+            syslog_channel->setProperty(Poco::Net::RemoteSyslogChannel::PROP_FORMAT, config.getString("logger.syslog.format", "syslog"));
+            syslog_channel->setProperty(Poco::Net::RemoteSyslogChannel::PROP_FACILITY, config.getString("logger.syslog.facility", "LOG_USER"));
+        }
+        else
+        {
+            syslog_channel = new Poco::SyslogChannel();
+            syslog_channel->setProperty(Poco::SyslogChannel::PROP_NAME, cmd_name);
+            syslog_channel->setProperty(Poco::SyslogChannel::PROP_OPTIONS, config.getString("logger.syslog.options", "LOG_CONS|LOG_PID"));
+            syslog_channel->setProperty(Poco::SyslogChannel::PROP_FACILITY, config.getString("logger.syslog.facility", "LOG_DAEMON"));
+        }
         syslog_channel->open();
+
+        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this, OwnPatternFormatter::ADD_LAYER_TAG);
+
+        Poco::AutoPtr<DB::OwnFormattingChannel> log = new DB::OwnFormattingChannel(pf, syslog_channel);
+        split->addChannel(log);
     }
 
-    if (config().getBool("logger.console", false) || (!config().hasProperty("logger.console") && !is_daemon && (isatty(STDIN_FILENO) || isatty(STDERR_FILENO))))
+    if (config.getBool("logger.console", false) || (!config.hasProperty("logger.console") && !is_daemon && (isatty(STDIN_FILENO) || isatty(STDERR_FILENO))))
     {
-        Poco::AutoPtr<ConsoleChannel> file = new ConsoleChannel;
-        Poco::AutoPtr<OwnPatternFormatter> pf = new OwnPatternFormatter(this);
-        pf->setProperty("times", "local");
-        Poco::AutoPtr<FormattingChannel> log = new FormattingChannel(pf);
-        log->setChannel(file);
-        logger().warning("Logging to console");
+        Poco::AutoPtr<DB::OwnFormattingChannel> log = new DB::OwnFormattingChannel(new OwnPatternFormatter(this), new Poco::ConsoleChannel);
+        logger().warning("Logging " + log_level + " to console");
         split->addChannel(log);
     }
 
@@ -671,19 +874,25 @@ void BaseDaemon::buildLoggers()
     logger().setChannel(split);
 
     // Global logging level (it can be overridden for specific loggers).
-    logger().setLevel(config().getString("logger.level", "trace"));
+    logger().setLevel(log_level);
+
+    // Set level to all already created loggers
+    std::vector <std::string> names;
+    Logger::root().names(names);
+    for (const auto & name : names)
+        Logger::root().get(name).setLevel(log_level);
 
     // Attach to the root logger.
-    Logger::root().setLevel(logger().getLevel());
+    Logger::root().setLevel(log_level);
     Logger::root().setChannel(logger().getChannel());
 
     // Explicitly specified log levels for specific loggers.
-    AbstractConfiguration::Keys levels;
-    config().keys("logger.levels", levels);
+    Poco::Util::AbstractConfiguration::Keys levels;
+    config.keys("logger.levels", levels);
 
-    if(!levels.empty())
-        for(AbstractConfiguration::Keys::iterator it = levels.begin(); it != levels.end(); ++it)
-            Logger::get(*it).setLevel(config().getString("logger.levels." + *it, "trace"));
+    if (!levels.empty())
+        for (const auto & level : levels)
+            Logger::get(level).setLevel(config.getString("logger.levels." + level, "trace"));
 }
 
 
@@ -703,10 +912,101 @@ std::string BaseDaemon::getDefaultCorePath() const
     return "/opt/cores/";
 }
 
+void BaseDaemon::closeFDs()
+{
+#if defined(__FreeBSD__) || (defined(__APPLE__) && defined(__MACH__))
+    Poco::File proc_path{"/dev/fd"};
+#else
+    Poco::File proc_path{"/proc/self/fd"};
+#endif
+    if (proc_path.isDirectory()) /// Hooray, proc exists
+    {
+        std::vector<std::string> fds;
+        /// in /proc/self/fd directory filenames are numeric file descriptors
+        proc_path.list(fds);
+        for (const auto & fd_str : fds)
+        {
+            int fd = DB::parse<int>(fd_str);
+            if (fd > 2 && fd != signal_pipe.read_fd && fd != signal_pipe.write_fd)
+                ::close(fd);
+        }
+    }
+    else
+    {
+        int max_fd = -1;
+#ifdef _SC_OPEN_MAX
+        max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd == -1)
+#endif
+            max_fd = 256; /// bad fallback
+        for (int fd = 3; fd < max_fd; ++fd)
+            if (fd != signal_pipe.read_fd && fd != signal_pipe.write_fd)
+                ::close(fd);
+    }
+}
+
 void BaseDaemon::initialize(Application & self)
 {
+    closeFDs();
     task_manager.reset(new Poco::TaskManager);
     ServerApplication::initialize(self);
+
+    {
+        /// Parsing all args and converting to config layer
+        /// Test: -- --1=1 --1=2 --3 5 7 8 -9 10 -11=12 14= 15== --16==17 --=18 --19= --20 21 22 --23 --24 25 --26 -27 28 ---29=30 -- ----31 32 --33 3-4
+        Poco::AutoPtr<Poco::Util::MapConfiguration> map_config = new Poco::Util::MapConfiguration;
+        std::string key;
+        for(auto & arg : argv())
+        {
+            auto key_start = arg.find_first_not_of('-');
+            auto pos_minus = arg.find('-');
+            auto pos_eq = arg.find('=');
+
+            // old saved '--key', will set to some true value "1"
+            if (!key.empty() && pos_minus != std::string::npos && pos_minus < key_start)
+            {
+                map_config->setString(key, "1");
+                key = "";
+            }
+
+            if (pos_eq == std::string::npos)
+            {
+                if (!key.empty())
+                {
+                    if (pos_minus == std::string::npos || pos_minus > key_start)
+                    {
+                        map_config->setString(key, arg);
+                    }
+                    key = "";
+                }
+                if (pos_minus != std::string::npos && key_start != std::string::npos && pos_minus < key_start)
+                    key = arg.substr(key_start);
+                continue;
+            }
+            else
+            {
+                key = "";
+            }
+
+            if (key_start == std::string::npos)
+                continue;
+
+            if (pos_minus > key_start)
+                continue;
+
+            key = arg.substr(key_start, pos_eq - key_start);
+            if (key.empty())
+                continue;
+            std::string value;
+            if (arg.size() > pos_eq)
+                value = arg.substr(pos_eq+1);
+
+            map_config->setString(key, value);
+            key = "";
+        }
+        /// now highest priority (lowest value) is PRIO_APPLICATION = -100, we want higher!
+        config().add(map_config, PRIO_APPLICATION - 100);
+    }
 
     bool is_daemon = config().getBool("application.runAsDaemon", false);
 
@@ -722,18 +1022,17 @@ void BaseDaemon::initialize(Application & self)
     reloadConfiguration();
 
     /// This must be done before creation of any files (including logs).
+    mode_t umask_num = 0027;
     if (config().has("umask"))
     {
         std::string umask_str = config().getString("umask");
-        mode_t umask_num = 0;
         std::stringstream stream;
         stream << umask_str;
         stream >> std::oct >> umask_num;
-
-        umask(umask_num);
     }
+    umask(umask_num);
 
-    ConfigProcessor(config_path).savePreprocessedConfig(loaded_config);
+    DB::ConfigProcessor(config_path).savePreprocessedConfig(loaded_config, "");
 
     /// Write core dump on crash.
     {
@@ -743,15 +1042,10 @@ void BaseDaemon::initialize(Application & self)
         /// 1 GiB by default. If more - it writes to disk too long.
         rlim.rlim_cur = config().getUInt64("core_dump.size_limit", 1024 * 1024 * 1024);
 
-        if (setrlimit(RLIMIT_CORE, &rlim))
+        if (rlim.rlim_cur && setrlimit(RLIMIT_CORE, &rlim))
         {
-            std::string message = "Cannot set max size of core file to " + std::to_string(rlim.rlim_cur);
-        #if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
-            throw Poco::Exception(message);
-        #else
             /// It doesn't work under address/thread sanitizer. http://lists.llvm.org/pipermail/llvm-bugs/2013-April/027880.html
-            std::cerr << message << std::endl;
-        #endif
+            std::cerr << "Cannot set max size of core file to " + std::to_string(rlim.rlim_cur) << std::endl;
         }
     }
 
@@ -768,30 +1062,46 @@ void BaseDaemon::initialize(Application & self)
     if (!log_path.empty())
         log_path = Poco::Path(log_path).setFileName("").toString();
 
-    if (is_daemon)
+    /** Redirect stdout, stderr to separate files in the log directory (or in the specified file).
+      * Some libraries write to stderr in case of errors in debug mode,
+      *  and this output makes sense even if the program is run in daemon mode.
+      * We have to do it before buildLoggers, for errors on logger initialization will be written to these files.
+      * If logger.stderr is specified then stderr will be forcibly redirected to that file.
+      */
+    if ((!log_path.empty() && is_daemon) || config().has("logger.stderr"))
     {
-        /** Redirect stdout, stderr to separate files in the log directory.
-          * Some libraries write to stderr in case of errors in debug mode,
-          *  and this output makes sense even if the program is run in daemon mode.
-          * We have to do it before buildLoggers, for errors on logger initialization will be written to these files.
-          */
-        if (!log_path.empty())
-        {
-            std::string stdout_path = log_path + "/stdout";
-            if (!freopen(stdout_path.c_str(), "a+", stdout))
-                throw Poco::OpenFileException("Cannot attach stdout to " + stdout_path);
-
-            std::string stderr_path = log_path + "/stderr";
-            if (!freopen(stderr_path.c_str(), "a+", stderr))
-                throw Poco::OpenFileException("Cannot attach stderr to " + stderr_path);
-        }
-
-        /// Create pid file.
-        if (is_daemon && config().has("pid"))
-            pid.seed(config().getString("pid"));
+        std::string stderr_path = config().getString("logger.stderr", log_path + "/stderr.log");
+        if (!freopen(stderr_path.c_str(), "a+", stderr))
+            throw Poco::OpenFileException("Cannot attach stderr to " + stderr_path);
     }
 
-    buildLoggers();
+    if ((!log_path.empty() && is_daemon) || config().has("logger.stdout"))
+    {
+        std::string stdout_path = config().getString("logger.stdout", log_path + "/stdout.log");
+        if (!freopen(stdout_path.c_str(), "a+", stdout))
+            throw Poco::OpenFileException("Cannot attach stdout to " + stdout_path);
+    }
+
+    /// Create pid file.
+    if (is_daemon && config().has("pid"))
+        pid.seed(config().getString("pid"));
+
+    /// Change path for logging.
+    if (!log_path.empty())
+    {
+        std::string path = createDirectory(log_path);
+        if (is_daemon
+            && chdir(path.c_str()) != 0)
+            throw Poco::Exception("Cannot change directory to " + path);
+    }
+    else
+    {
+        if (is_daemon
+            && chdir("/tmp") != 0)
+            throw Poco::Exception("Cannot change directory to /tmp");
+    }
+
+    buildLoggers(config());
 
     if (is_daemon)
     {
@@ -816,6 +1126,18 @@ void BaseDaemon::initialize(Application & self)
             throw Poco::Exception("Cannot change directory to " + core_path);
     }
 
+    initializeTerminationAndSignalProcessing();
+    logRevision();
+
+    for (const auto & key : DB::getMultipleKeysFromConfig(config(), "", "graphite"))
+    {
+        graphite_writers.emplace(key, std::make_unique<GraphiteWriter>(key));
+    }
+}
+
+
+void BaseDaemon::initializeTerminationAndSignalProcessing()
+{
     std::set_terminate(terminate_handler);
 
     /// We want to avoid SIGPIPE when working with sockets and pipes, and just handle return value/errno instead.
@@ -843,7 +1165,7 @@ void BaseDaemon::initialize(Application & self)
                         throw Poco::Exception("Cannot set signal handler.");
 
                 for (auto signal : signals)
-                    if (sigaction(signal, &sa, 0))
+                    if (sigaction(signal, &sa, nullptr))
                         throw Poco::Exception("Cannot set signal handler.");
             }
         };
@@ -856,26 +1178,20 @@ void BaseDaemon::initialize(Application & self)
     static KillingErrorHandler killing_error_handler;
     Poco::ErrorHandler::set(&killing_error_handler);
 
-    logRevision();
-
     signal_listener.reset(new SignalListener(*this));
     signal_listener_thread.start(*signal_listener);
 
-    for (const auto & key : DB::getMultipleKeysFromConfig(config(), "", "graphite"))
-    {
-        graphite_writers.emplace(key, std::make_unique<GraphiteWriter>(key));
-    }
 }
 
 void BaseDaemon::logRevision() const
 {
-    Logger::root().information("Starting daemon with revision " + Poco::NumberFormatter::format(ClickHouseRevision::get()));
+    Logger::root().information("Starting " + std::string{VERSION_FULL} + " with revision " + std::to_string(ClickHouseRevision::get()));
 }
 
 /// Makes server shutdown if at least one Poco::Task have failed.
 void BaseDaemon::exitOnTaskError()
 {
-    Observer<BaseDaemon, Poco::TaskFailedNotification> obs(*this, &BaseDaemon::handleNotification);
+    Poco::Observer<BaseDaemon, Poco::TaskFailedNotification> obs(*this, &BaseDaemon::handleNotification);
     getTaskManager().addObserver(obs);
 }
 
@@ -883,7 +1199,7 @@ void BaseDaemon::exitOnTaskError()
 void BaseDaemon::handleNotification(Poco::TaskFailedNotification *_tfn)
 {
     task_failed = true;
-    AutoPtr<Poco::TaskFailedNotification> fn(_tfn);
+    Poco::AutoPtr<Poco::TaskFailedNotification> fn(_tfn);
     Logger *lg = &(logger());
     LOG_ERROR(lg, "Task '" << fn->task()->name() << "' failed. Daemon is shutting down. Reason - " << fn->reason().displayText());
     ServerApplication::terminate();
@@ -1003,7 +1319,7 @@ void BaseDaemon::handleSignal(int signal_id)
         onInterruptSignals(signal_id);
     }
     else
-        throw DB::Exception(std::string("Unsupported signal: ") + strsignal(signal_id));
+        throw DB::Exception(std::string("Unsupported signal: ") + strsignal(signal_id), 0);
 }
 
 void BaseDaemon::onInterruptSignals(int signal_id)

@@ -6,18 +6,20 @@
 namespace DB
 {
 
-/** Query with output options (supporting [INTO OUTFILE 'file_name'] [FORMAT format_name] suffix).
+/** Query with output options
+  * (supporting [INTO OUTFILE 'file_name'] [FORMAT format_name] [SETTINGS key1 = value1, key2 = value2, ...] suffix).
   */
 class ASTQueryWithOutput : public IAST
 {
 public:
     ASTPtr out_file;
     ASTPtr format;
-
-    ASTQueryWithOutput() = default;
-    explicit ASTQueryWithOutput(const StringRange range_) : IAST(range_) {}
+    ASTPtr settings_ast;
 
     void formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const final;
+
+    /// Remove 'FORMAT <fmt> and INTO OUTFILE <file>' if exists
+    static bool resetOutputASTIfExist(IAST & ast);
 
 protected:
     /// NOTE: call this helper at the end of the clone() method of descendant class.
@@ -28,17 +30,17 @@ protected:
 };
 
 
-template <typename AstIDAndQueryNames>
+/** Helper template for simple queries like SHOW PROCESSLIST.
+  */
+template <typename ASTIDAndQueryNames>
 class ASTQueryWithOutputImpl : public ASTQueryWithOutput
 {
 public:
-    explicit ASTQueryWithOutputImpl() = default;
-    explicit ASTQueryWithOutputImpl(StringRange range_) : ASTQueryWithOutput(range_) {}
-    String getID() const override { return AstIDAndQueryNames::ID; };
+    String getID(char) const override { return ASTIDAndQueryNames::ID; }
 
     ASTPtr clone() const override
     {
-        auto res = std::make_shared<ASTQueryWithOutputImpl<AstIDAndQueryNames>>(*this);
+        auto res = std::make_shared<ASTQueryWithOutputImpl<ASTIDAndQueryNames>>(*this);
         res->children.clear();
         cloneOutputOptions(*res);
         return res;
@@ -48,7 +50,7 @@ protected:
     void formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override
     {
         settings.ostr << (settings.hilite ? hilite_keyword : "")
-                      << AstIDAndQueryNames::Query << (settings.hilite ? hilite_none : "");
+            << ASTIDAndQueryNames::Query << (settings.hilite ? hilite_none : "");
     }
 };
 

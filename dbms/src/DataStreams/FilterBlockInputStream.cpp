@@ -17,39 +17,51 @@ namespace ErrorCodes
 }
 
 
-FilterBlockInputStream::FilterBlockInputStream(const BlockInputStreamPtr & input, const ExpressionActionsPtr & expression_, ssize_t filter_column_)
-    : expression(expression_), filter_column(filter_column_)
+FilterBlockInputStream::FilterBlockInputStream(const BlockInputStreamPtr & input, const ExpressionActionsPtr & expression_,
+                                               const String & filter_column_name, bool remove_filter)
+    : remove_filter(remove_filter), expression(expression_)
 {
     children.push_back(input);
-}
 
-FilterBlockInputStream::FilterBlockInputStream(const BlockInputStreamPtr & input, const ExpressionActionsPtr & expression_, const String & filter_column_name_)
-    : expression(expression_), filter_column(-1), filter_column_name(filter_column_name_)
-{
-    children.push_back(input);
+    /// Determine position of filter column.
+    header = input->getHeader();
+    expression->execute(header);
+
+    filter_column = header.getPositionByName(filter_column_name);
+    auto & column_elem = header.safeGetByPosition(filter_column);
+
+    /// Isn't the filter already constant?
+    if (column_elem.column)
+        constant_filter_description = ConstantFilterDescription(*column_elem.column);
+
+    if (!constant_filter_description.always_false
+        && !constant_filter_description.always_true)
+    {
+        /// Replace the filter column to a constant with value 1.
+        FilterDescription filter_description_check(*column_elem.column);
+        column_elem.column = column_elem.type->createColumnConst(header.rows(), 1u);
+    }
+
+    if (remove_filter)
+        header.erase(filter_column_name);
 }
 
 
 String FilterBlockInputStream::getName() const { return "Filter"; }
 
 
-String FilterBlockInputStream::getID() const
+Block FilterBlockInputStream::getTotals()
 {
-    std::stringstream res;
-    res << "Filter(" << children.back()->getID() << ", " << expression->getID() << ", " << filter_column << ", " << filter_column_name << ")";
-    return res.str();
+    totals = children.back()->getTotals();
+    expression->executeOnTotals(totals);
+
+    return totals;
 }
 
 
-const Block & FilterBlockInputStream::getTotals()
+Block FilterBlockInputStream::getHeader() const
 {
-    if (IProfilingBlockInputStream * child = dynamic_cast<IProfilingBlockInputStream *>(&*children.back()))
-    {
-        totals = child->getTotals();
-        expression->executeOnTotals(totals);
-    }
-
-    return totals;
+    return header;
 }
 
 
@@ -57,33 +69,8 @@ Block FilterBlockInputStream::readImpl()
 {
     Block res;
 
-    if (is_first)
-    {
-        is_first = false;
-
-        const Block & sample_block = expression->getSampleBlock();
-
-        /// Find the current position of the filter column in the block.
-        /** sample_block has the result structure of evaluating the expression.
-          * But this structure does not necessarily match expression->execute(res) below,
-          *  because the expression can be applied to a block that also contains additional,
-          *  columns unnecessary for this expression, but needed later, in the next stages of the query execution pipeline.
-          * There will be no such columns in sample_block.
-          * Therefore, the position of the filter column in it can be different.
-          */
-        ssize_t filter_column_in_sample_block = filter_column;
-        if (filter_column_in_sample_block == -1)
-            filter_column_in_sample_block = sample_block.getPositionByName(filter_column_name);
-
-        /// Let's check if the filter column is a constant containing 0 or 1.
-        ColumnPtr column = sample_block.safeGetByPosition(filter_column_in_sample_block).column;
-
-        if (column)
-            constant_filter_description = ConstantFilterDescription(*column);
-
-        if (constant_filter_description.always_false)
-            return res;
-    }
+    if (constant_filter_description.always_false)
+        return removeFilterIfNeed(std::move(res));
 
     /// Until non-empty block after filtering or end of stream.
     while (1)
@@ -95,11 +82,7 @@ Block FilterBlockInputStream::readImpl()
         expression->execute(res);
 
         if (constant_filter_description.always_true)
-            return res;
-
-        /// Find the current position of the filter column in the block.
-        if (filter_column == -1)
-            filter_column = res.getPositionByName(filter_column_name);
+            return removeFilterIfNeed(std::move(res));
 
         size_t columns = res.columns();
         ColumnPtr column = res.safeGetByPosition(filter_column).column;
@@ -118,7 +101,7 @@ Block FilterBlockInputStream::readImpl()
         }
 
         if (constant_filter_description.always_true)
-            return res;
+            return removeFilterIfNeed(std::move(res));
 
         FilterDescription filter_and_holder(*column);
 
@@ -158,9 +141,9 @@ Block FilterBlockInputStream::readImpl()
         if (filtered_rows == filter_and_holder.data->size())
         {
             /// Replace the column with the filter by a constant.
-            res.safeGetByPosition(filter_column).column = res.safeGetByPosition(filter_column).type->createColumnConst(filtered_rows, UInt64(1));
+            res.safeGetByPosition(filter_column).column = res.safeGetByPosition(filter_column).type->createColumnConst(filtered_rows, 1u);
             /// No need to touch the rest of the columns.
-            return res;
+            return removeFilterIfNeed(std::move(res));
         }
 
         /// Filter the rest of the columns.
@@ -175,7 +158,7 @@ Block FilterBlockInputStream::readImpl()
                 /// Example:
                 ///  SELECT materialize(100) AS x WHERE x
                 /// will work incorrectly.
-                current_column.column = current_column.type->createColumnConst(filtered_rows, UInt64(1));
+                current_column.column = current_column.type->createColumnConst(filtered_rows, 1u);
                 continue;
             }
 
@@ -188,8 +171,17 @@ Block FilterBlockInputStream::readImpl()
                 current_column.column = current_column.column->filter(*filter_and_holder.data, -1);
         }
 
-        return res;
+        return removeFilterIfNeed(std::move(res));
     }
+}
+
+
+Block FilterBlockInputStream::removeFilterIfNeed(Block && block)
+{
+    if (block && remove_filter)
+        block.erase(static_cast<size_t>(filter_column));
+
+    return std::move(block);
 }
 
 

@@ -17,6 +17,12 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_COLUMN;
+    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
+}
+
 namespace Nested
 {
 
@@ -71,37 +77,6 @@ std::string extractTableName(const std::string & nested_name)
 }
 
 
-NamesAndTypesList flatten(const NamesAndTypesList & names_and_types)
-{
-    NamesAndTypesList res;
-
-    for (const auto & name_type : names_and_types)
-    {
-        if (const DataTypeArray * type_arr = typeid_cast<const DataTypeArray *>(name_type.type.get()))
-        {
-            if (const DataTypeTuple * type_tuple = typeid_cast<const DataTypeTuple *>(type_arr->getNestedType().get()))
-            {
-                const DataTypes & elements = type_tuple->getElements();
-                const Strings & names = type_tuple->getElementNames();
-                size_t tuple_size = elements.size();
-
-                for (size_t i = 0; i < tuple_size; ++i)
-                {
-                    String nested_name = concatenateName(name_type.name, names[i]);
-                    res.emplace_back(nested_name, std::make_shared<DataTypeArray>(elements[i]));
-                }
-            }
-            else
-                res.push_back(name_type);
-        }
-        else
-            res.push_back(name_type);
-    }
-
-    return res;
-}
-
-
 Block flatten(const Block & block)
 {
     Block res;
@@ -126,7 +101,7 @@ Block flatten(const Block & block)
                 const ColumnPtr & column_offsets = column_array->getOffsetsPtr();
 
                 const ColumnTuple & column_tuple = typeid_cast<const ColumnTuple &>(column_array->getData());
-                const Columns & element_columns = column_tuple.getColumns();
+                const auto & element_columns = column_tuple.getColumns();
 
                 for (size_t i = 0; i < tuple_size; ++i)
                 {
@@ -179,6 +154,45 @@ NamesAndTypesList collect(const NamesAndTypesList & names_and_types)
             std::make_shared<DataTypeTuple>(name_elems.second.getTypes(), name_elems.second.getNames())));
 
     return res;
+}
+
+
+void validateArraySizes(const Block & block)
+{
+    /// Nested prefix -> position of first column in block.
+    std::map<std::string, size_t> nested;
+
+    for (size_t i = 0, size = block.columns(); i < size; ++i)
+    {
+        const auto & elem = block.getByPosition(i);
+
+        if (isArray(elem.type))
+        {
+            if (!typeid_cast<const ColumnArray *>(elem.column.get()))
+                throw Exception("Column with Array type is not represented by ColumnArray column: " + elem.column->dumpStructure(), ErrorCodes::ILLEGAL_COLUMN);
+
+            auto splitted = splitName(elem.name);
+
+            /// Is it really a column of Nested data structure.
+            if (!splitted.second.empty())
+            {
+                auto [it, inserted] = nested.emplace(splitted.first, i);
+
+                /// It's not the first column of Nested data structure.
+                if (!inserted)
+                {
+                    const ColumnArray & first_array_column = static_cast<const ColumnArray &>(*block.getByPosition(it->second).column);
+                    const ColumnArray & another_array_column = static_cast<const ColumnArray &>(*elem.column);
+
+                    if (!first_array_column.hasEqualOffsets(another_array_column))
+                        throw Exception("Elements '" + block.getByPosition(it->second).name
+                            + "' and '" + elem.name
+                            + "' of Nested data structure '" + splitted.first
+                            + "' (Array columns) have different array sizes.", ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH);
+                }
+            }
+        }
+    }
 }
 
 }

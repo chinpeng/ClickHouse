@@ -1,9 +1,4 @@
 # ClickHouse Development
 
-```eval_rst
-.. toctree::
-    :glob:
 
-    *
-```
-
+[Original article](https://clickhouse.yandex/docs/en/development/) <!--hide-->

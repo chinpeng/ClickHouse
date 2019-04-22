@@ -1,14 +1,18 @@
 #pragma once
 
-#include <Core/Names.h>
 #include <Common/Exception.h>
-#include <Common/RWLockFIFO.h>
+#include <Common/RWLock.h>
+#include <Core/Names.h>
 #include <Core/QueryProcessingStage.h>
+#include <Databases/IDatabase.h>
 #include <Storages/ITableDeclaration.h>
+#include <Storages/TableStructureLockHolder.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Interpreters/CancellationCode.h>
 #include <shared_mutex>
 #include <memory>
 #include <optional>
+#include <Common/ActionLock.h>
 
 
 namespace DB
@@ -17,14 +21,14 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int TABLE_IS_DROPPED;
+    extern const int NOT_IMPLEMENTED;
 }
 
 class Context;
 class IBlockInputStream;
 class IBlockOutputStream;
 
-class RWLockFIFO;
-using RWLockFIFOPtr = std::shared_ptr<RWLockFIFO>;
+using StorageActionBlockType = size_t;
 
 using BlockOutputStreamPtr = std::shared_ptr<IBlockOutputStream>;
 using BlockInputStreamPtr = std::shared_ptr<IBlockInputStream>;
@@ -35,39 +39,13 @@ class ASTCreateQuery;
 class IStorage;
 
 using StoragePtr = std::shared_ptr<IStorage>;
+using StorageWeakPtr = std::weak_ptr<IStorage>;
 
 struct Settings;
 
 class AlterCommands;
-
-
-/** Does not allow changing the table description (including rename and delete the table).
-  * If during any operation the table structure should remain unchanged, you need to hold such a lock for all of its time.
-  * For example, you need to hold such a lock for the duration of the entire SELECT or INSERT query and for the whole time the merge of the set of parts
-  *  (but between the selection of parts for the merge and their merging, the table structure can change).
-  * NOTE: This is a lock to "read" the table's description. To change the table description, you need to take the TableStructureWriteLock.
-  */
-class TableStructureReadLock
-{
-private:
-    friend class IStorage;
-
-    StoragePtr storage;
-    /// Order is important.
-    RWLockFIFO::LockHandler data_lock;
-    RWLockFIFO::LockHandler structure_lock;
-
-public:
-    TableStructureReadLock(StoragePtr storage_, bool lock_structure, bool lock_data, const std::string & who);
-};
-
-
-using TableStructureReadLockPtr = std::shared_ptr<TableStructureReadLock>;
-using TableStructureReadLocks = std::vector<TableStructureReadLockPtr>;
-
-using TableStructureWriteLock = RWLockFIFO::LockHandler;
-using TableDataWriteLock = RWLockFIFO::LockHandler;
-using TableFullWriteLock = std::pair<TableDataWriteLock, TableStructureWriteLock>;
+class MutationCommands;
+class PartitionCommands;
 
 
 /** Storage. Responsible for
@@ -82,6 +60,10 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
 public:
     /// The main name of the table type (for example, StorageMergeTree).
     virtual std::string getName() const = 0;
+
+    /// The name of the table.
+    virtual std::string getTableName() const = 0;
+    virtual std::string getDatabaseName() const { return {}; }  // FIXME: should be abstract method.
 
     /** Returns true if the storage receives data from a remote server or servers. */
     virtual bool isRemote() const { return false; }
@@ -98,53 +80,82 @@ public:
     /** Returns true if the storage replicates SELECT, INSERT and ALTER commands among replicas. */
     virtual bool supportsReplication() const { return false; }
 
-    /** Does not allow you to change the structure or name of the table.
-      * If you change the data in the table, you will need to specify will_modify_data = true.
-      * This will take an extra lock that does not allow starting ALTER MODIFY.
-      * Parameter 'who' identifies a client of the lock (ALTER query, merge process, etc), used for diagnostic purposes.
-      *
-      * WARNING: You need to call methods from ITableDeclaration under such a lock. Without it, they are not thread safe.
-      * WARNING: To avoid deadlocks, this method must not be called under lock of Context.
-      */
-    TableStructureReadLockPtr lockStructure(bool will_modify_data, const std::string & who)
+    /** Returns true if the storage supports deduplication of inserted data blocks . */
+    virtual bool supportsDeduplication() const { return false; }
+
+
+    /// Acquire this lock if you need the table structure to remain constant during the execution of
+    /// the query. If will_add_new_data is true, this means that the query will add new data to the table
+    /// (INSERT or a parts merge).
+    TableStructureReadLockHolder lockStructureForShare(bool will_add_new_data, const String & query_id)
     {
-        TableStructureReadLockPtr res = std::make_shared<TableStructureReadLock>(shared_from_this(), true, will_modify_data, who);
+        TableStructureReadLockHolder result;
+        if (will_add_new_data)
+            result.new_data_structure_lock = new_data_structure_lock->getLock(RWLockImpl::Read, query_id);
+        result.structure_lock = structure_lock->getLock(RWLockImpl::Read, query_id);
+
         if (is_dropped)
             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
-        return res;
+        return result;
     }
 
-    /** Does not allow reading the table structure. It is taken for ALTER, RENAME and DROP.
-      */
-    TableFullWriteLock lockForAlter(const std::string & who = "Alter")
+    /// Acquire this lock at the start of ALTER to lock out other ALTERs and make sure that only you
+    /// can modify the table structure. It can later be upgraded to the exclusive lock.
+    TableStructureWriteLockHolder lockAlterIntention(const String & query_id)
     {
-        /// The calculation order is important.
-        auto data_lock = lockDataForAlter(who);
-        auto structure_lock = lockStructureForAlter(who);
+        TableStructureWriteLockHolder result;
+        result.alter_intention_lock = alter_intention_lock->getLock(RWLockImpl::Write, query_id);
 
-        return {std::move(data_lock), std::move(structure_lock)};
-    }
-
-    /** Does not allow changing the data in the table. (Moreover, does not give a look at the structure of the table with the intention to change the data).
-      * It is taken during write temporary data in ALTER MODIFY.
-      * Under this lock, you can take lockStructureForAlter() to change the structure of the table.
-      */
-    TableDataWriteLock lockDataForAlter(const std::string & who = "Alter")
-    {
-        auto res = data_lock->getLock(RWLockFIFO::Write, who);
         if (is_dropped)
             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
-        return res;
+        return result;
     }
 
-    TableStructureWriteLock lockStructureForAlter(const std::string & who = "Alter")
+    /// Upgrade alter intention lock and make sure that no new data is inserted into the table.
+    /// This is used by the ALTER MODIFY of the MergeTree storage to consistently determine
+    /// the set of parts that needs to be altered.
+    void lockNewDataStructureExclusively(TableStructureWriteLockHolder & lock_holder, const String & query_id)
     {
-        auto res = structure_lock->getLock(RWLockFIFO::Write, who);
+        if (!lock_holder.alter_intention_lock)
+            throw Exception("Alter intention lock for table " + getTableName() + " was not taken. This is a bug.",
+                ErrorCodes::LOGICAL_ERROR);
+
+        lock_holder.new_data_structure_lock = new_data_structure_lock->getLock(RWLockImpl::Write, query_id);
+    }
+
+    /// Upgrade alter intention lock to the full exclusive structure lock. This is done by ALTER queries
+    /// to ensure that no other query uses the table structure and it can be safely changed.
+    void lockStructureExclusively(TableStructureWriteLockHolder & lock_holder, const String & query_id)
+    {
+        if (!lock_holder.alter_intention_lock)
+            throw Exception("Alter intention lock for table " + getTableName() + " was not taken. This is a bug.",
+                ErrorCodes::LOGICAL_ERROR);
+
+        if (!lock_holder.new_data_structure_lock)
+            lock_holder.new_data_structure_lock = new_data_structure_lock->getLock(RWLockImpl::Write, query_id);
+        lock_holder.structure_lock = structure_lock->getLock(RWLockImpl::Write, query_id);
+    }
+
+    /// Acquire the full exclusive lock immediately. No other queries can run concurrently.
+    TableStructureWriteLockHolder lockExclusively(const String & query_id)
+    {
+        TableStructureWriteLockHolder result;
+        result.alter_intention_lock = alter_intention_lock->getLock(RWLockImpl::Write, query_id);
+
         if (is_dropped)
             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
-        return res;
+
+        result.new_data_structure_lock = new_data_structure_lock->getLock(RWLockImpl::Write, query_id);
+        result.structure_lock = structure_lock->getLock(RWLockImpl::Write, query_id);
+
+        return result;
     }
 
+    /** Returns stage to which query is going to be processed in read() function.
+      * (Normally, the function only reads the columns from the list, but in other cases,
+      *  for example, the request can be partially processed on a remote server.)
+      */
+    virtual QueryProcessingStage::Enum getQueryProcessingStage(const Context &) const { return QueryProcessingStage::FetchColumns; }
 
     /** Read a set of columns from the table.
       * Accepts a list of columns to read, as well as a description of the query,
@@ -152,9 +163,7 @@ public:
       *  (indexes, locks, etc.)
       * Returns a stream with which you can read data sequentially
       *  or multiple streams for parallel data reading.
-      * The `processed_stage` info is also written to what stage the request was processed.
-      * (Normally, the function only reads the columns from the list, but in other cases,
-      *  for example, the request can be partially processed on a remote server.)
+      * The `processed_stage` must be the result of getQueryProcessingStage() function.
       *
       * context contains settings for one query.
       * Usually Storage does not care about these settings, since they are used in the interpreter.
@@ -169,7 +178,7 @@ public:
         const Names & /*column_names*/,
         const SelectQueryInfo & /*query_info*/,
         const Context & /*context*/,
-        QueryProcessingStage::Enum & /*processed_stage*/,
+        QueryProcessingStage::Enum /*processed_stage*/,
         size_t /*max_block_size*/,
         unsigned /*num_streams*/)
     {
@@ -184,15 +193,25 @@ public:
       */
     virtual BlockOutputStreamPtr write(
         const ASTPtr & /*query*/,
-        const Settings & /*settings*/)
+        const Context & /*context*/)
     {
         throw Exception("Method write is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
 
     /** Delete the table data. Called before deleting the directory with the data.
+      * The method can be called only after detaching table from Context (when no queries are performed with table).
+      * The table is not usable during and after call to this method.
       * If you do not need any action other than deleting the directory with data, you can leave this method blank.
       */
     virtual void drop() {}
+
+    /** Clear the table data and leave it empty.
+      * Must be called under lockForAlter.
+      */
+    virtual void truncate(const ASTPtr & /*query*/, const Context & /* context */)
+    {
+        throw Exception("Truncate is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+    }
 
     /** Rename the table.
       * Renaming a name in a file with metadata, the name in the list of tables in the RAM, is done separately.
@@ -208,43 +227,14 @@ public:
       * This method must fully execute the ALTER query, taking care of the locks itself.
       * To update the table metadata on disk, this method should call InterpreterAlterQuery::updateMetadata.
       */
-    virtual void alter(const AlterCommands & /*params*/, const String & /*database_name*/, const String & /*table_name*/, const Context & /*context*/)
-    {
-        throw Exception("Method alter is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
-    }
+    virtual void alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context, TableStructureWriteLockHolder & table_lock_holder);
 
-    /** Execute CLEAR COLUMN ... IN PARTITION query which removes column from given partition. */
-    virtual void clearColumnInPartition(const ASTPtr & /*partition*/, const Field & /*column_name*/, const Context & /*context*/)
-    {
-        throw Exception("Method dropColumnFromPartition is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
-    }
-
-    /** Run the query (DROP|DETACH) PARTITION.
+    /** ALTER tables with regard to its partitions.
+      * Should handle locks for each command on its own.
       */
-    virtual void dropPartition(const ASTPtr & /*query*/, const ASTPtr & /*partition*/, bool /*detach*/, const Context & /*context*/)
+    virtual void alterPartition(const ASTPtr & /* query */, const PartitionCommands & /* commands */, const Context & /* context */)
     {
-        throw Exception("Method dropPartition is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
-    }
-
-    /** Run the ATTACH request (PART|PARTITION).
-      */
-    virtual void attachPartition(const ASTPtr & /*partition*/, bool /*part*/, const Context & /*context*/)
-    {
-        throw Exception("Method attachPartition is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
-    }
-
-    /** Run the FETCH PARTITION query.
-      */
-    virtual void fetchPartition(const ASTPtr & /*partition*/, const String & /*from*/, const Context & /*context*/)
-    {
-        throw Exception("Method fetchPartition is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
-    }
-
-    /** Run the FREEZE PARTITION request. That is, create a local backup (snapshot) of data using the `localBackup` function (see localBackup.h)
-      */
-    virtual void freezePartition(const ASTPtr & /*partition*/, const String & /*with_name*/, const Context & /*context*/)
-    {
-        throw Exception("Method freezePartition is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+        throw Exception("Partition operations are not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
 
     /** Perform any background work. For example, combining parts in a MergeTree type table.
@@ -253,6 +243,18 @@ public:
     virtual bool optimize(const ASTPtr & /*query*/, const ASTPtr & /*partition*/, bool /*final*/, bool /*deduplicate*/, const Context & /*context*/)
     {
         throw Exception("Method optimize is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    /// Mutate the table contents
+    virtual void mutate(const MutationCommands &, const Context &)
+    {
+        throw Exception("Mutations are not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    /// Cancel a mutation.
+    virtual CancellationCode killMutation(const String & /*mutation_id*/)
+    {
+        throw Exception("Mutations are not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
 
     /** If the table have to do some complicated work on startup,
@@ -272,51 +274,87 @@ public:
       */
     virtual void shutdown() {}
 
+    /// Asks table to stop executing some action identified by action_type
+    /// If table does not support such type of lock, and empty lock is returned
+    virtual ActionLock getActionLock(StorageActionBlockType /* action_type */)
+    {
+        return {};
+    }
+
     bool is_dropped{false};
 
     /// Does table support index for IN sections
     virtual bool supportsIndexForIn() const { return false; }
 
+    /// Provides a hint that the storage engine may evaluate the IN-condition by using an index.
+    virtual bool mayBenefitFromIndexForIn(const ASTPtr & /* left_in_operand */, const Context & /* query_context */) const { return false; }
+
     /// Checks validity of the data
-    virtual bool checkData() const { throw DB::Exception("Check query is not supported for " + getName() + " storage"); }
+    virtual bool checkData() const { throw Exception("Check query is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
 
     /// Checks that table could be dropped right now
-    /// If it can - returns true
-    /// Otherwise - throws an exception with detailed information or returns false
-    virtual bool checkTableCanBeDropped() const { return true; }
+    /// Otherwise - throws an exception with detailed information.
+    /// We do not use mutex because it is not very important that the size could change during the operation.
+    virtual void checkTableCanBeDropped() const {}
 
+    /// Checks that Partition could be dropped right now
+    /// Otherwise - throws an exception with detailed information.
+    /// We do not use mutex because it is not very important that the size could change during the operation.
+    virtual void checkPartitionCanBeDropped(const ASTPtr & /*partition*/) {}
 
     /** Notify engine about updated dependencies for this storage. */
     virtual void updateDependencies() {}
 
-protected:
+    /// Returns data path if storage supports it, empty string otherwise.
+    virtual String getDataPath() const { return {}; }
+
+    /// Returns ASTExpressionList of partition key expression for storage or nullptr if there is none.
+    virtual ASTPtr getPartitionKeyAST() const { return nullptr; }
+
+    /// Returns ASTExpressionList of sorting key expression for storage or nullptr if there is none.
+    virtual ASTPtr getSortingKeyAST() const { return nullptr; }
+
+    /// Returns ASTExpressionList of primary key expression for storage or nullptr if there is none.
+    virtual ASTPtr getPrimaryKeyAST() const { return nullptr; }
+
+    /// Returns sampling expression AST for storage or nullptr if there is none.
+    virtual ASTPtr getSamplingKeyAST() const { return nullptr; }
+
+    /// Returns additional columns that need to be read to calculate partition key.
+    virtual Names getColumnsRequiredForPartitionKey() const { return {}; }
+
+    /// Returns additional columns that need to be read to calculate sorting key.
+    virtual Names getColumnsRequiredForSortingKey() const { return {}; }
+
+    /// Returns additional columns that need to be read to calculate primary key.
+    virtual Names getColumnsRequiredForPrimaryKey() const { return {}; }
+
+    /// Returns additional columns that need to be read to calculate sampling key.
+    virtual Names getColumnsRequiredForSampling() const { return {}; }
+
+    /// Returns additional columns that need to be read for FINAL to work.
+    virtual Names getColumnsRequiredForFinal() const { return {}; }
+
     using ITableDeclaration::ITableDeclaration;
     using std::enable_shared_from_this<IStorage>::shared_from_this;
 
 private:
-    friend class TableStructureReadLock;
+    /// You always need to take the next three locks in this order.
 
-    /// You always need to take the next two locks in this order.
+    /// If you hold this lock exclusively, you can be sure that no other structure modifying queries
+    /// (e.g. ALTER, DROP) are concurrently executing. But queries that only read table structure
+    /// (e.g. SELECT, INSERT) can continue to execute.
+    mutable RWLock alter_intention_lock = RWLockImpl::create();
 
-    /** It is taken for read for the entire INSERT query and the entire merge of the parts (for MergeTree).
-      * It is taken for write for the entire time ALTER MODIFY.
-      *
-      * Formally:
-      * Taking a write lock ensures that:
-      *  1) the data in the table will not change while the lock is alive,
-      *  2) all changes to the data after releasing the lock will be based on the structure of the table at the time after the lock was released.
-      * You need to take for read for the entire time of the operation that changes the data.
-      */
-    mutable RWLockFIFOPtr data_lock = RWLockFIFO::create();
+    /// It is taken for share for the entire INSERT query and the entire merge of the parts (for MergeTree).
+    /// ALTER COLUMN queries acquire an exclusive lock to ensure that no new parts with the old structure
+    /// are added to the table and thus the set of parts to modify doesn't change.
+    mutable RWLock new_data_structure_lock = RWLockImpl::create();
 
-    /** Lock for multiple columns and path to table. It is taken for write at RENAME, ALTER (for ALTER MODIFY for a while) and DROP.
-      * It is taken for read for the whole time of SELECT, INSERT and merge parts (for MergeTree).
-      *
-      * Taking this lock for writing is a strictly "stronger" operation than taking parts_writing_lock for write record.
-      * That is, if this lock is taken for write, you should not worry about `parts_writing_lock`.
-      * parts_writing_lock is only needed for cases when you do not want to take `table_structure_lock` for long operations (ALTER MODIFY).
-      */
-    mutable RWLockFIFOPtr structure_lock = RWLockFIFO::create();
+    /// Lock for the table column structure (names, types, etc.) and data path.
+    /// It is taken in exclusive mode by queries that modify them (e.g. RENAME, ALTER and DROP)
+    /// and in share mode by other queries.
+    mutable RWLock structure_lock = RWLockImpl::create();
 };
 
 /// table name -> table

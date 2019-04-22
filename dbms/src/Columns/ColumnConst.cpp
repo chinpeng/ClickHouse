@@ -25,12 +25,17 @@ ColumnConst::ColumnConst(const ColumnPtr & data_, size_t s)
             ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 }
 
-MutableColumnPtr ColumnConst::convertToFullColumn() const
+ColumnPtr ColumnConst::convertToFullColumn() const
 {
     return data->replicate(Offsets(1, s));
 }
 
-MutableColumnPtr ColumnConst::filter(const Filter & filt, ssize_t /*result_size_hint*/) const
+ColumnPtr ColumnConst::removeLowCardinality() const
+{
+    return ColumnConst::create(data->convertToFullColumnIfLowCardinality(), s);
+}
+
+ColumnPtr ColumnConst::filter(const Filter & filt, ssize_t /*result_size_hint*/) const
 {
     if (s != filt.size())
         throw Exception("Size of filter (" + toString(filt.size()) + ") doesn't match size of column (" + toString(s) + ")",
@@ -39,7 +44,7 @@ MutableColumnPtr ColumnConst::filter(const Filter & filt, ssize_t /*result_size_
     return ColumnConst::create(data, countBytesInFilter(filt));
 }
 
-MutableColumnPtr ColumnConst::replicate(const Offsets & offsets) const
+ColumnPtr ColumnConst::replicate(const Offsets & offsets) const
 {
     if (s != offsets.size())
         throw Exception("Size of offsets (" + toString(offsets.size()) + ") doesn't match size of column (" + toString(s) + ")",
@@ -49,7 +54,7 @@ MutableColumnPtr ColumnConst::replicate(const Offsets & offsets) const
     return ColumnConst::create(data, replicated_size);
 }
 
-MutableColumnPtr ColumnConst::permute(const Permutation & perm, size_t limit) const
+ColumnPtr ColumnConst::permute(const Permutation & perm, size_t limit) const
 {
     if (limit == 0)
         limit = s;
@@ -63,15 +68,25 @@ MutableColumnPtr ColumnConst::permute(const Permutation & perm, size_t limit) co
     return ColumnConst::create(data, limit);
 }
 
+ColumnPtr ColumnConst::index(const IColumn & indexes, size_t limit) const
+{
+    if (limit == 0)
+        limit = indexes.size();
+
+    if (indexes.size() < limit)
+        throw Exception("Size of indexes (" + toString(indexes.size()) + ") is less than required (" + toString(limit) + ")",
+                        ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+
+    return ColumnConst::create(data, limit);
+}
+
 MutableColumns ColumnConst::scatter(ColumnIndex num_columns, const Selector & selector) const
 {
     if (s != selector.size())
         throw Exception("Size of selector (" + toString(selector.size()) + ") doesn't match size of column (" + toString(s) + ")",
             ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::vector<size_t> counts(num_columns);
-    for (auto idx : selector)
-        ++counts[idx];
+    std::vector<size_t> counts = countColumnsSizeInSelector(num_columns, selector);
 
     MutableColumns res(num_columns);
     for (size_t i = 0; i < num_columns; ++i)

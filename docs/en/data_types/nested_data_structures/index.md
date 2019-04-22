@@ -1,9 +1,4 @@
-# Nested data structures
+# Nested Data Structures
 
-```eval_rst
-.. toctree::
-    :glob:
-    
-    *
-```
 
+[Original article](https://clickhouse.yandex/docs/en/data_types/nested_data_structures/) <!--hide-->

@@ -1,9 +1,10 @@
 #pragma once
 
 #include <Common/PODArray.h>
+#include <Common/NaNUtils.h>
+#include <Core/Types.h>
 #include <IO/WriteBuffer.h>
 #include <IO/ReadBuffer.h>
-#include <Core/Types.h>
 #include <IO/VarInt.h>
 
 
@@ -18,7 +19,7 @@ namespace ErrorCodes
 /** Calculates quantile by collecting all values into array
   *  and applying n-th element (introselect) algorithm for the resulting array.
   *
-  * It use O(N) memory and it is very inefficient in case of high amount of identical values.
+  * It uses O(N) memory and it is very inefficient in case of high amount of identical values.
   * But it is very CPU efficient for not large datasets.
   */
 template <typename Value>
@@ -32,7 +33,9 @@ struct QuantileExact
 
     void add(const Value & x)
     {
-        array.push_back(x);
+        /// We must skip NaNs as they are not compatible with comparison sorting.
+        if (!isNaN(x))
+            array.push_back(x);
     }
 
     template <typename Weight>
@@ -50,7 +53,7 @@ struct QuantileExact
     {
         size_t size = array.size();
         writeVarUInt(size, buf);
-        buf.write(reinterpret_cast<const char *>(&array[0]), size * sizeof(array[0]));
+        buf.write(reinterpret_cast<const char *>(array.data()), size * sizeof(array[0]));
     }
 
     void deserialize(ReadBuffer & buf)
@@ -58,7 +61,7 @@ struct QuantileExact
         size_t size = 0;
         readVarUInt(size, buf);
         array.resize(size);
-        buf.read(reinterpret_cast<char *>(&array[0]), size * sizeof(array[0]));
+        buf.read(reinterpret_cast<char *>(array.data()), size * sizeof(array[0]));
     }
 
     /// Get the value of the `level` quantile. The level must be between 0 and 1.
@@ -74,7 +77,7 @@ struct QuantileExact
             return array[n];
         }
 
-        return Value();
+        return std::numeric_limits<Value>::quiet_NaN();
     }
 
     /// Get the `size` values of `levels` quantiles. Write `size` results starting with `result` address.

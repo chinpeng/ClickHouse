@@ -1,8 +1,12 @@
-#if __SSE2__
+#ifdef __SSE2__
     #include <emmintrin.h>
 #endif
 
 #include <Columns/IColumn.h>
+#include <Columns/ColumnVector.h>
+#include <Common/typeid_cast.h>
+#include <Common/HashTable/HashSet.h>
+#include <Common/HashTable/HashMap.h>
 
 
 namespace DB
@@ -17,10 +21,10 @@ size_t countBytesInFilter(const IColumn::Filter & filt)
       * It would be better to use != 0, then this does not allow SSE2.
       */
 
-    const Int8 * pos = reinterpret_cast<const Int8 *>(&filt[0]);
+    const Int8 * pos = reinterpret_cast<const Int8 *>(filt.data());
     const Int8 * end = pos + filt.size();
 
-#if __SSE2__ && __POPCNT__
+#if defined(__SSE2__) && defined(__POPCNT__)
     const __m128i zero16 = _mm_setzero_si128();
     const Int8 * end64 = pos + filt.size() / 64 * 64;
 
@@ -48,6 +52,14 @@ size_t countBytesInFilter(const IColumn::Filter & filt)
     return count;
 }
 
+std::vector<size_t> countColumnsSizeInSelector(IColumn::ColumnIndex num_columns, const IColumn::Selector & selector)
+{
+    std::vector<size_t> counts(num_columns);
+    for (auto idx : selector)
+        ++counts[idx];
+
+    return counts;
+}
 
 /** clang 4 generates better code than gcc 6.
   * And both gcc and clang could not vectorize trivial loop by bytes automatically.
@@ -57,7 +69,7 @@ bool memoryIsZero(const void * data, size_t size)
     const Int8 * pos = reinterpret_cast<const Int8 *>(data);
     const Int8 * end = pos + size;
 
-#if __SSE2__
+#ifdef __SSE2__
     const __m128 zero16 = _mm_setzero_ps();
     const Int8 * end64 = pos + size / 64 * 64;
 
@@ -184,26 +196,26 @@ namespace
                 res_elems.reserve((result_size_hint * src_elems.size() + size - 1) / size);
         }
 
-        const UInt8 * filt_pos = &filt[0];
+        const UInt8 * filt_pos = filt.data();
         const auto filt_end = filt_pos + size;
 
-        auto offsets_pos = &src_offsets[0];
+        auto offsets_pos = src_offsets.data();
         const auto offsets_begin = offsets_pos;
 
         /// copy array ending at *end_offset_ptr
         const auto copy_array = [&] (const IColumn::Offset * offset_ptr)
         {
-            const auto offset = offset_ptr == offsets_begin ? 0 : offset_ptr[-1];
-            const auto size = *offset_ptr - offset;
+            const auto arr_offset = offset_ptr == offsets_begin ? 0 : offset_ptr[-1];
+            const auto arr_size = *offset_ptr - arr_offset;
 
-            result_offsets_builder.insertOne(size);
+            result_offsets_builder.insertOne(arr_size);
 
             const auto elems_size_old = res_elems.size();
-            res_elems.resize(elems_size_old + size);
-            memcpy(&res_elems[elems_size_old], &src_elems[offset], size * sizeof(T));
+            res_elems.resize(elems_size_old + arr_size);
+            memcpy(&res_elems[elems_size_old], &src_elems[arr_offset], arr_size * sizeof(T));
         };
 
-    #if __SSE2__
+    #ifdef __SSE2__
         const __m128i zero_vec = _mm_setzero_si128();
         static constexpr size_t SIMD_BYTES = 16;
         const auto filt_end_aligned = filt_pos + size / SIMD_BYTES * SIMD_BYTES;
@@ -299,5 +311,23 @@ INSTANTIATE(Float32)
 INSTANTIATE(Float64)
 
 #undef INSTANTIATE
+
+namespace detail
+{
+    template <typename T>
+    const PaddedPODArray<T> * getIndexesData(const IColumn & indexes)
+    {
+        auto * column = typeid_cast<const ColumnVector<T> *>(&indexes);
+        if (column)
+            return &column->getData();
+
+        return nullptr;
+    }
+
+    template const PaddedPODArray<UInt8> * getIndexesData<UInt8>(const IColumn & indexes);
+    template const PaddedPODArray<UInt16> * getIndexesData<UInt16>(const IColumn & indexes);
+    template const PaddedPODArray<UInt32> * getIndexesData<UInt32>(const IColumn & indexes);
+    template const PaddedPODArray<UInt64> * getIndexesData<UInt64>(const IColumn & indexes);
+}
 
 }

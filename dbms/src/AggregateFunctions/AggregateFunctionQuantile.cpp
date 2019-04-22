@@ -1,18 +1,7 @@
-#include <AggregateFunctions/AggregateFunctionFactory.h>
-#include <AggregateFunctions/Helpers.h>
-#include <AggregateFunctions/FactoryHelpers.h>
-
 #include <AggregateFunctions/AggregateFunctionQuantile.h>
 
-#include <AggregateFunctions/QuantileReservoirSampler.h>
-#include <AggregateFunctions/QuantileReservoirSamplerDeterministic.h>
-#include <AggregateFunctions/QuantileExact.h>
-#include <AggregateFunctions/QuantileExactWeighted.h>
-#include <AggregateFunctions/QuantileTiming.h>
-#include <AggregateFunctions/QuantileTDigest.h>
-
-#include <DataTypes/DataTypeDate.h>
-#include <DataTypes/DataTypeDateTime.h>
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <AggregateFunctions/Helpers.h>
 
 
 namespace DB
@@ -26,125 +15,103 @@ namespace ErrorCodes
 namespace
 {
 
-template <template <typename> class Data, typename Name, bool have_second_arg, typename FloatReturnType, bool returns_many>
-AggregateFunctionPtr createAggregateFunctionQuantile(const std::string & name, const DataTypes & argument_types, const Array & params)
+template <typename Value, bool FloatReturn> using FuncQuantile = AggregateFunctionQuantile<Value, QuantileReservoirSampler<Value>, NameQuantile, false, std::conditional_t<FloatReturn, Float64, void>, false>;
+template <typename Value, bool FloatReturn> using FuncQuantiles = AggregateFunctionQuantile<Value, QuantileReservoirSampler<Value>, NameQuantiles, false, std::conditional_t<FloatReturn, Float64, void>, true>;
+
+template <typename Value, bool FloatReturn> using FuncQuantileDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantileDeterministic, true, std::conditional_t<FloatReturn, Float64, void>, false>;
+template <typename Value, bool FloatReturn> using FuncQuantilesDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantilesDeterministic, true, std::conditional_t<FloatReturn, Float64, void>, true>;
+
+template <typename Value, bool _> using FuncQuantileExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantileExact, false, void, false>;
+template <typename Value, bool _> using FuncQuantilesExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantilesExact, false, void, true>;
+
+template <typename Value, bool _> using FuncQuantileExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantileExactWeighted, true, void, false>;
+template <typename Value, bool _> using FuncQuantilesExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantilesExactWeighted, true, void, true>;
+
+template <typename Value, bool _> using FuncQuantileTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantileTiming, false, Float32, false>;
+template <typename Value, bool _> using FuncQuantilesTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantilesTiming, false, Float32, true>;
+
+template <typename Value, bool _> using FuncQuantileTimingWeighted = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantileTimingWeighted, true, Float32, false>;
+template <typename Value, bool _> using FuncQuantilesTimingWeighted = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantilesTimingWeighted, true, Float32, true>;
+
+template <typename Value, bool FloatReturn> using FuncQuantileTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigest, false, std::conditional_t<FloatReturn, Float32, void>, false>;
+template <typename Value, bool FloatReturn> using FuncQuantilesTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigest, false, std::conditional_t<FloatReturn, Float32, void>, true>;
+
+template <typename Value, bool FloatReturn> using FuncQuantileTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigestWeighted, true, std::conditional_t<FloatReturn, Float32, void>, false>;
+template <typename Value, bool FloatReturn> using FuncQuantilesTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigestWeighted, true, std::conditional_t<FloatReturn, Float32, void>, true>;
+
+
+template <template <typename, bool> class Function>
+static constexpr bool supportDecimal()
 {
-    if (have_second_arg)
-        assertBinary(name, argument_types);
-    else
-        assertUnary(name, argument_types);
-
-    const DataTypePtr & argument_type = argument_types[0];
-
-#define CREATE(TYPE) \
-    if (typeid_cast<const DataType ## TYPE *>(argument_type.get())) \
-        return std::make_shared<AggregateFunctionQuantile<TYPE, Data<TYPE>, Name, have_second_arg, FloatReturnType, returns_many>>(argument_type, params);
-
-    FOR_NUMERIC_TYPES(CREATE)
-#undef CREATE
-
-    if (typeid_cast<const DataTypeDate *>(argument_type.get()))
-        return std::make_shared<AggregateFunctionQuantile<
-            DataTypeDate::FieldType, Data<DataTypeDate::FieldType>, Name, have_second_arg, void, returns_many>>(argument_type, params);
-    if (typeid_cast<const DataTypeDateTime *>(argument_type.get()))
-        return std::make_shared<AggregateFunctionQuantile<
-            DataTypeDateTime::FieldType, Data<DataTypeDateTime::FieldType>, Name, have_second_arg, void, returns_many>>(argument_type, params);
-
-    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name, ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    return std::is_same_v<Function<Float32, false>, FuncQuantileExact<Float32, false>> ||
+        std::is_same_v<Function<Float32, false>, FuncQuantilesExact<Float32, false>>;
 }
 
-#undef FOR_NUMERIC_TYPES
 
+template <template <typename, bool> class Function>
+AggregateFunctionPtr createAggregateFunctionQuantile(const std::string & name, const DataTypes & argument_types, const Array & params)
+{
+    /// Second argument type check doesn't depend on the type of the first one.
+    Function<void, true>::assertSecondArg(argument_types);
 
-struct NameQuantile { static constexpr auto name = "quantile"; };
-struct NameQuantiles { static constexpr auto name = "quantiles"; };
-struct NameQuantileDeterministic { static constexpr auto name = "quantileDeterministic"; };
-struct NameQuantilesDeterministic { static constexpr auto name = "quantilesDeterministic"; };
+    const DataTypePtr & argument_type = argument_types[0];
+    WhichDataType which(argument_type);
 
-struct NameQuantileExact { static constexpr auto name = "quantileExact"; };
-struct NameQuantileExactWeighted { static constexpr auto name = "quantileExactWeighted"; };
-struct NameQuantilesExact { static constexpr auto name = "quantilesExact"; };
-struct NameQuantilesExactWeighted { static constexpr auto name = "quantilesExactWeighted"; };
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_type, params);
+    FOR_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_type, params);
+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_type, params);
 
-struct NameQuantileTiming { static constexpr auto name = "quantileTiming"; };
-struct NameQuantileTimingWeighted { static constexpr auto name = "quantileTimingWeighted"; };
-struct NameQuantilesTiming { static constexpr auto name = "quantilesTiming"; };
-struct NameQuantilesTimingWeighted { static constexpr auto name = "quantilesTimingWeighted"; };
+    if constexpr (supportDecimal<Function>())
+    {
+        if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, true>>(argument_type, params);
+        if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, true>>(argument_type, params);
+        if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, true>>(argument_type, params);
+    }
 
-struct NameQuantileTDigest { static constexpr auto name = "quantileTDigest"; };
-struct NameQuantileTDigestWeighted { static constexpr auto name = "quantileTDigestWeighted"; };
-struct NameQuantilesTDigest { static constexpr auto name = "quantilesTDigest"; };
-struct NameQuantilesTDigestWeighted { static constexpr auto name = "quantilesTDigestWeighted"; };
+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+}
 
 }
 
 void registerAggregateFunctionsQuantile(AggregateFunctionFactory & factory)
 {
-    factory.registerFunction(NameQuantile::name,
-        createAggregateFunctionQuantile<QuantileReservoirSampler, NameQuantile, false, Float64, false>);
-    factory.registerFunction(NameQuantiles::name,
-        createAggregateFunctionQuantile<QuantileReservoirSampler, NameQuantiles, false, Float64, true>);
+    factory.registerFunction(NameQuantile::name, createAggregateFunctionQuantile<FuncQuantile>);
+    factory.registerFunction(NameQuantiles::name, createAggregateFunctionQuantile<FuncQuantiles>);
 
-    factory.registerFunction(NameQuantileDeterministic::name,
-        createAggregateFunctionQuantile<QuantileReservoirSamplerDeterministic, NameQuantileDeterministic, true, Float64, false>);
-    factory.registerFunction(NameQuantilesDeterministic::name,
-        createAggregateFunctionQuantile<QuantileReservoirSamplerDeterministic, NameQuantilesDeterministic, true, Float64, true>);
+    factory.registerFunction(NameQuantileDeterministic::name, createAggregateFunctionQuantile<FuncQuantileDeterministic>);
+    factory.registerFunction(NameQuantilesDeterministic::name, createAggregateFunctionQuantile<FuncQuantilesDeterministic>);
 
-    factory.registerFunction(NameQuantileExact::name,
-        createAggregateFunctionQuantile<QuantileExact, NameQuantileExact, false, void, false>);
-    factory.registerFunction(NameQuantilesExact::name,
-        createAggregateFunctionQuantile<QuantileExact, NameQuantilesExact, false, void, true>);
+    factory.registerFunction(NameQuantileExact::name, createAggregateFunctionQuantile<FuncQuantileExact>);
+    factory.registerFunction(NameQuantilesExact::name, createAggregateFunctionQuantile<FuncQuantilesExact>);
 
-    factory.registerFunction(NameQuantileExactWeighted::name,
-        createAggregateFunctionQuantile<QuantileExactWeighted, NameQuantileExactWeighted, true, void, false>);
-    factory.registerFunction(NameQuantilesExactWeighted::name,
-        createAggregateFunctionQuantile<QuantileExactWeighted, NameQuantilesExactWeighted, true, void, true>);
+    factory.registerFunction(NameQuantileExactWeighted::name, createAggregateFunctionQuantile<FuncQuantileExactWeighted>);
+    factory.registerFunction(NameQuantilesExactWeighted::name, createAggregateFunctionQuantile<FuncQuantilesExactWeighted>);
 
-    factory.registerFunction(NameQuantileTiming::name,
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantileTiming, false, Float32, false>);
-    factory.registerFunction(NameQuantilesTiming::name,
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantilesTiming, false, Float32, true>);
+    factory.registerFunction(NameQuantileTiming::name, createAggregateFunctionQuantile<FuncQuantileTiming>);
+    factory.registerFunction(NameQuantilesTiming::name, createAggregateFunctionQuantile<FuncQuantilesTiming>);
 
-    factory.registerFunction(NameQuantileTimingWeighted::name,
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantileTimingWeighted, true, Float32, false>);
-    factory.registerFunction(NameQuantilesTimingWeighted::name,
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantilesTimingWeighted, true, Float32, true>);
+    factory.registerFunction(NameQuantileTimingWeighted::name, createAggregateFunctionQuantile<FuncQuantileTimingWeighted>);
+    factory.registerFunction(NameQuantilesTimingWeighted::name, createAggregateFunctionQuantile<FuncQuantilesTimingWeighted>);
 
-    factory.registerFunction(NameQuantileTDigest::name,
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantileTDigest, false, Float32, false>);
-    factory.registerFunction(NameQuantilesTDigest::name,
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantilesTDigest, false, Float32, true>);
+    factory.registerFunction(NameQuantileTDigest::name, createAggregateFunctionQuantile<FuncQuantileTDigest>);
+    factory.registerFunction(NameQuantilesTDigest::name, createAggregateFunctionQuantile<FuncQuantilesTDigest>);
 
-    factory.registerFunction(NameQuantileTDigestWeighted::name,
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantileTDigestWeighted, true, Float32, false>);
-    factory.registerFunction(NameQuantilesTDigestWeighted::name,
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantilesTDigestWeighted, true, Float32, true>);
+    factory.registerFunction(NameQuantileTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantileTDigestWeighted>);
+    factory.registerFunction(NameQuantilesTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantilesTDigestWeighted>);
 
     /// 'median' is an alias for 'quantile'
-
-    factory.registerFunction("median",
-        createAggregateFunctionQuantile<QuantileReservoirSampler, NameQuantile, false, Float64, false>);
-
-    factory.registerFunction("medianDeterministic",
-        createAggregateFunctionQuantile<QuantileReservoirSamplerDeterministic, NameQuantileDeterministic, true, Float64, false>);
-
-    factory.registerFunction("medianExact",
-        createAggregateFunctionQuantile<QuantileExact, NameQuantileExact, false, void, false>);
-
-    factory.registerFunction("medianExactWeighted",
-        createAggregateFunctionQuantile<QuantileExactWeighted, NameQuantileExactWeighted, true, void, false>);
-
-    factory.registerFunction("medianTiming",
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantileTiming, false, Float32, false>);
-
-    factory.registerFunction("medianTimingWeighted",
-        createAggregateFunctionQuantile<QuantileTiming, NameQuantileTimingWeighted, true, Float32, false>);
-
-    factory.registerFunction("medianTDigest",
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantileTDigest, false, Float32, false>);
-
-    factory.registerFunction("medianTDigestWeighted",
-        createAggregateFunctionQuantile<QuantileTDigest, NameQuantileTDigestWeighted, true, Float32, false>);
+    factory.registerAlias("median", NameQuantile::name);
+    factory.registerAlias("medianDeterministic", NameQuantileDeterministic::name);
+    factory.registerAlias("medianExact", NameQuantileExact::name);
+    factory.registerAlias("medianExactWeighted", NameQuantileExactWeighted::name);
+    factory.registerAlias("medianTiming", NameQuantileTiming::name);
+    factory.registerAlias("medianTimingWeighted", NameQuantileTimingWeighted::name);
+    factory.registerAlias("medianTDigest", NameQuantileTDigest::name);
+    factory.registerAlias("medianTDigestWeighted", NameQuantileTDigestWeighted::name);
 }
 
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Common/HashTable/HashMap.h>
+#include <Common/NaNUtils.h>
 
 
 namespace DB
@@ -11,9 +12,9 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
-/** Calculates quantile by counting number of occurences for each value in a hash map.
+/** Calculates quantile by counting number of occurrences for each value in a hash map.
   *
-  * It use O(distinct(N)) memory. Can be naturally applied for values with weight.
+  * It uses O(distinct(N)) memory. Can be naturally applied for values with weight.
   * In case of many identical values, it can be more efficient than QuantileExact even when weight is not used.
   */
 template <typename Value>
@@ -33,18 +34,21 @@ struct QuantileExactWeighted
 
     void add(const Value & x)
     {
-        ++map[x];
+        /// We must skip NaNs as they are not compatible with comparison sorting.
+        if (!isNaN(x))
+            ++map[x];
     }
 
     void add(const Value & x, const Weight & weight)
     {
-        map[x] += weight;
+        if (!isNaN(x))
+            map[x] += weight;
     }
 
     void merge(const QuantileExactWeighted & rhs)
     {
         for (const auto & pair : rhs.map)
-            map[pair.first] += pair.second;
+            map[pair.getFirst()] += pair.getSecond();
     }
 
     void serialize(WriteBuffer & buf) const
@@ -58,7 +62,7 @@ struct QuantileExactWeighted
         while (reader.next())
         {
             const auto & pair = reader.get();
-            map[pair.first] = pair.second;
+            map[pair.getFirst()] = pair.getSecond();
         }
     }
 
@@ -68,7 +72,7 @@ struct QuantileExactWeighted
         size_t size = map.size();
 
         if (0 == size)
-            return Value();
+            return std::numeric_limits<Value>::quiet_NaN();
 
         /// Copy the data to a temporary array to get the element you need in order.
         using Pair = typename Map::value_type;
@@ -79,12 +83,12 @@ struct QuantileExactWeighted
         UInt64 sum_weight = 0;
         for (const auto & pair : map)
         {
-            sum_weight += pair.second;
-            array[i] = pair;
+            sum_weight += pair.getSecond();
+            array[i] = pair.getValue();
             ++i;
         }
 
-        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
+        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.getFirst() < b.getFirst(); });
 
         UInt64 threshold = std::ceil(sum_weight * level);
         UInt64 accumulated = 0;
@@ -93,7 +97,7 @@ struct QuantileExactWeighted
         const Pair * end = array + size;
         while (it < end)
         {
-            accumulated += it->second;
+            accumulated += it->getSecond();
 
             if (accumulated >= threshold)
                 break;
@@ -104,7 +108,7 @@ struct QuantileExactWeighted
         if (it == end)
             --it;
 
-        return it->first;
+        return it->getFirst();
     }
 
     /// Get the `size` values of `levels` quantiles. Write `size` results starting with `result` address.
@@ -129,12 +133,12 @@ struct QuantileExactWeighted
         UInt64 sum_weight = 0;
         for (const auto & pair : map)
         {
-            sum_weight += pair.second;
-            array[i] = pair;
+            sum_weight += pair.getSecond();
+            array[i] = pair.getValue();
             ++i;
         }
 
-        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
+        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.getFirst() < b.getFirst(); });
 
         UInt64 accumulated = 0;
 
@@ -146,11 +150,11 @@ struct QuantileExactWeighted
 
         while (it < end)
         {
-            accumulated += it->second;
+            accumulated += it->getSecond();
 
             while (accumulated >= threshold)
             {
-                result[indices[level_index]] = it->first;
+                result[indices[level_index]] = it->getFirst();
                 ++level_index;
 
                 if (level_index == num_levels)
@@ -164,7 +168,7 @@ struct QuantileExactWeighted
 
         while (level_index < num_levels)
         {
-            result[indices[level_index]] = array[size - 1].first;
+            result[indices[level_index]] = array[size - 1].getFirst();
             ++level_index;
         }
     }

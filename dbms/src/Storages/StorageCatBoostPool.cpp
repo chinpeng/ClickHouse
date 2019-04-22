@@ -1,14 +1,17 @@
-#include <Storages/StorageCatBoostPool.h>
-#include <DataStreams/IProfilingBlockInputStream.h>
-#include <DataStreams/FormatFactory.h>
-#include <IO/ReadBufferFromFile.h>
 #include <fstream>
+#include <sstream>
+#include <boost/filesystem.hpp>
+
+#include <Storages/StorageCatBoostPool.h>
+#include <DataStreams/IBlockInputStream.h>
+#include <Formats/FormatFactory.h>
+#include <IO/ReadBufferFromFile.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataStreams/FilterColumnsBlockInputStream.h>
 #include <Interpreters/Context.h>
-#include <boost/filesystem.hpp>
 #include <Parsers/ASTIdentifier.h>
+
 
 namespace DB
 {
@@ -22,26 +25,21 @@ namespace ErrorCodes
 
 namespace
 {
-class CatBoostDatasetBlockInputStream : public IProfilingBlockInputStream
+class CatBoostDatasetBlockInputStream : public IBlockInputStream
 {
 public:
 
     CatBoostDatasetBlockInputStream(const std::string & file_name, const std::string & format_name,
-                                    const Block & sample_block, const Context & context, size_t max_block_size)
+                                    const Block & sample_block, const Context & context, UInt64 max_block_size)
             : file_name(file_name), format_name(format_name)
     {
         read_buf = std::make_unique<ReadBufferFromFile>(file_name);
-        reader = FormatFactory().getInput(format_name, *read_buf, sample_block, context, max_block_size);
+        reader = FormatFactory::instance().getInput(format_name, *read_buf, sample_block, context, max_block_size);
     }
 
     String getName() const override
     {
-        return "CatBoostDatasetBlockInputStream";
-    }
-
-    String getID() const override
-    {
-        return "CatBoostDataset(" + format_name + ", " + file_name + ")";
+        return "CatBoostDataset";
     }
 
     Block readImpl() override
@@ -59,8 +57,9 @@ public:
         reader->readSuffix();
     }
 
+    Block getHeader() const override { return reader->getHeader(); }
+
 private:
-    Block sample_block;
     std::unique_ptr<ReadBufferFromFileDescriptor> read_buf;
     BlockInputStreamPtr reader;
     std::string file_name;
@@ -78,8 +77,8 @@ static std::string resolvePath(const boost::filesystem::path & base_path, std::s
 {
     boost::filesystem::path resolved_path(path);
     if (!resolved_path.is_absolute())
-        return (base_path / resolved_path).string();
-    return resolved_path.string();
+        return boost::filesystem::canonical(resolved_path, base_path).string();
+    return boost::filesystem::canonical(resolved_path).string();
 }
 
 static void checkCreationIsAllowed(const String & base_path, const String & path)
@@ -199,7 +198,7 @@ void StorageCatBoostPool::parseColumnDescription()
         }
 
         if (num_id >= columns_description.size())
-            throw Exception("Invalid index at row  " + str_line_num + ": " + str_id
+            throw Exception("Invalid index at row " + str_line_num + ": " + str_id
                             + ", expected in range [0, " + std::to_string(columns_description.size()) + ")",
                             ErrorCodes::CANNOT_PARSE_TEXT);
 
@@ -223,47 +222,71 @@ void StorageCatBoostPool::parseColumnDescription()
 
 void StorageCatBoostPool::createSampleBlockAndColumns()
 {
-    columns.clear();
+    ColumnsDescription columns;
     NamesAndTypesList cat_columns;
     NamesAndTypesList num_columns;
+    NamesAndTypesList other_columns;
     sample_block.clear();
+
+    auto get_type = [](DatasetColumnType column_type) -> DataTypePtr
+    {
+        if (column_type == DatasetColumnType::Categ
+            || column_type == DatasetColumnType::Auxiliary
+            || column_type == DatasetColumnType::DocId)
+            return std::make_shared<DataTypeString>();
+        else
+            return std::make_shared<DataTypeFloat64>();
+    };
+
     for (auto & desc : columns_description)
     {
-        DataTypePtr type;
-        if (desc.column_type == DatasetColumnType::Categ
-            || desc.column_type == DatasetColumnType::Auxiliary
-            || desc.column_type == DatasetColumnType::DocId)
-            type = std::make_shared<DataTypeString>();
-        else
-            type = std::make_shared<DataTypeFloat64>();
+        DataTypePtr type = get_type(desc.column_type);
 
         if (desc.column_type == DatasetColumnType::Categ)
             cat_columns.emplace_back(desc.column_name, type);
         else if (desc.column_type == DatasetColumnType::Num)
             num_columns.emplace_back(desc.column_name, type);
         else
-            materialized_columns.emplace_back(desc.column_name, type);
+            other_columns.emplace_back(desc.column_name, type);
 
+        sample_block.insert(ColumnWithTypeAndName(type, desc.column_name));
+    }
+
+    /// Order is important: first numeric columns, then categorial, then all others.
+    for (const auto & column : num_columns)
+        columns.add(DB::ColumnDescription(column.name, column.type));
+    for (const auto & column : cat_columns)
+        columns.add(DB::ColumnDescription(column.name, column.type));
+    for (const auto & column : other_columns)
+    {
+        DB::ColumnDescription column_desc(column.name, column.type);
+        /// We assign Materialized kind to the column so that it doesn't show in SELECT *.
+        /// Because the table is readonly, we do not need default expression.
+        column_desc.default_desc.kind = ColumnDefaultKind::Materialized;
+        columns.add(std::move(column_desc));
+    }
+
+    for (auto & desc : columns_description)
+    {
         if (!desc.alias.empty())
         {
-            auto alias = std::make_shared<ASTIdentifier>();
-            alias->name = desc.column_name;
-            column_defaults[desc.alias] = {ColumnDefaultType::Alias, alias};
-            alias_columns.emplace_back(desc.alias, type);
+            DB::ColumnDescription column(desc.alias, get_type(desc.column_type));
+            column.default_desc.kind = ColumnDefaultKind::Alias;
+            column.default_desc.expression = std::make_shared<ASTIdentifier>(desc.column_name);
+            columns.add(std::move(column));
         }
-
-        sample_block.insert(ColumnWithTypeAndName(type->createColumn(), type, desc.column_name));
     }
-    columns.insert(columns.end(), num_columns.begin(), num_columns.end());
-    columns.insert(columns.end(), cat_columns.begin(), cat_columns.end());
+
+    setColumns(columns);
 }
 
-BlockInputStreams StorageCatBoostPool::read(const Names & column_names,
-                       const SelectQueryInfo & /*query_info*/,
-                       const Context & context,
-                       QueryProcessingStage::Enum & /*processed_stage*/,
-                       size_t max_block_size,
-                       unsigned /*threads*/)
+BlockInputStreams StorageCatBoostPool::read(
+    const Names & column_names,
+    const SelectQueryInfo & /*query_info*/,
+    const Context & context,
+    QueryProcessingStage::Enum /*processed_stage*/,
+    size_t max_block_size,
+    unsigned /*threads*/)
 {
     auto stream = std::make_shared<CatBoostDatasetBlockInputStream>(
             data_description_file_name, "TSV", sample_block, context, max_block_size);

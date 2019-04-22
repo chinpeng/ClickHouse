@@ -26,11 +26,9 @@ public:
 
     Rational ratio;
 
-    ASTSampleRatio() = default;
-    ASTSampleRatio(const StringRange range_) : IAST(range_) {}
-    ASTSampleRatio(const StringRange range_, Rational & ratio_) : IAST(range_), ratio(ratio_) {}
+    ASTSampleRatio(Rational & ratio_) : ratio(ratio_) {}
 
-    String getID() const override { return "SampleRatio_" + toString(ratio); }
+    String getID(char delim) const override { return "SampleRatio" + (delim + toString(ratio)); }
 
     ASTPtr clone() const override { return std::make_shared<ASTSampleRatio>(*this); }
 

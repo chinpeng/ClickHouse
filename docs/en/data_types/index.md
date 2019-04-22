@@ -1,13 +1,8 @@
-<a name="data_types"></a>
+# Data Types {#data_types}
 
-# Data types
+ClickHouse can store various types of data in table cells.
 
-```eval_rst
-.. toctree::
-    :glob:
+This section describes the supported data types and special considerations when using and/or implementing them, if any.
 
-    *
-    */index
 
-```
-
+[Original article](https://clickhouse.yandex/docs/en/data_types/) <!--hide-->

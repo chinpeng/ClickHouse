@@ -3,7 +3,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Core/Defines.h>
 #include <Core/Types.h>
-#include <Interpreters/SettingsCommon.h>
+#include <Core/SettingsCommon.h>
 
 
 namespace DB
@@ -63,9 +63,12 @@ struct MergeTreeSettings
      *  duplicating INSERTs during that period of time. */                                                    \
     M(SettingUInt64, replicated_deduplication_window_seconds, 7 * 24 * 60 * 60) /** one week */               \
                                                                                                               \
+    /** How many records may be in log, if there is inactive replica  */                                      \
+    M(SettingUInt64, max_replicated_logs_to_keep, 10000)                                                      \
+                                                                                                              \
     /** Keep about this number of last records in ZooKeeper log, even if they are obsolete.                   \
      *  It doesn't affect work of tables: used only to diagnose ZooKeeper log before cleaning. */             \
-    M(SettingUInt64, replicated_logs_to_keep, 100)                                                            \
+    M(SettingUInt64, min_replicated_logs_to_keep, 100)                                                        \
                                                                                                               \
     /** After specified amount of time passed after replication log entry creation                            \
      *  and sum size of parts is greater than threshold,                                                      \
@@ -88,6 +91,10 @@ struct MergeTreeSettings
     /** Limit parallel fetches */                                                                             \
     M(SettingUInt64, replicated_max_parallel_fetches, 0)                                                      \
     M(SettingUInt64, replicated_max_parallel_fetches_for_table, 0)                                            \
+                                                                                                              \
+    /** Limit parallel fetches from endpoint (actually pool size) */                                          \
+    M(SettingUInt64, replicated_max_parallel_fetches_for_host, DEFAULT_COUNT_OF_HTTP_CONNECTIONS_PER_ENDPOINT)\
+                                                                                                              \
     /** Limit parallel sends */                                                                               \
     M(SettingUInt64, replicated_max_parallel_sends, 0)                                                        \
     M(SettingUInt64, replicated_max_parallel_sends_for_table, 0)                                              \
@@ -104,6 +111,9 @@ struct MergeTreeSettings
                                                                                                               \
     /** Period to clean old queue logs, blocks hashes and parts */                                            \
     M(SettingUInt64, cleanup_delay_period, 30)                                                                \
+    /** Add uniformly distributed value from 0 to x seconds to cleanup_delay_period                           \
+        to avoid thundering herd effect and subsequent DoS of ZooKeeper in case of very large number of tables */ \
+    M(SettingUInt64, cleanup_delay_period_random_add, 10)                                                     \
                                                                                                               \
     /** Minimal delay from other replicas to yield leadership. Here and further 0 means unlimited. */         \
     M(SettingUInt64, min_relative_delay_to_yield_leadership, 120)                                             \
@@ -131,9 +141,35 @@ struct MergeTreeSettings
       *  for backward compatibility.                                                                          \
       */                                                                                                      \
     M(SettingBool, compatibility_allow_sampling_expression_not_in_primary_key, false)                         \
+                                                                                                              \
+    /** Use small format (dozens bytes) for part checksums in ZooKeeper                                       \
+      *  instead of ordinary ones (dozens KB).                                                                \
+      * Before enabling check that all replicas support new format.                                           \
+      */                                                                                                      \
+    M(SettingBool, use_minimalistic_checksums_in_zookeeper, true)                                             \
+                                                                                                              \
+    /** Store part header (checksums and columns) in a compact format and a single part znode                 \
+      *  instead of separate znodes (<part>/columns and <part>/checksums).                                    \
+      * This can dramatically reduce snapshot size in ZooKeeper.                                              \
+      * Before enabling check that all replicas support new format.                                           \
+      */                                                                                                      \
+    M(SettingBool, use_minimalistic_part_header_in_zookeeper, false)                                          \
+                                                                                                              \
+    /** How many records about mutations that are done to keep.                                               \
+     *  If zero, then keep all of them */                                                                     \
+    M(SettingUInt64, finished_mutations_to_keep, 100)                                                         \
+                                                                                                              \
+    /** Minimal amount of bytes to enable O_DIRECT in merge (0 - disabled) */                                 \
+    M(SettingUInt64, min_merge_bytes_to_use_direct_io, 10ULL * 1024 * 1024 * 1024)                            \
+                                                                                                              \
+    /** Approximate amount of bytes in single granule (0 - disabled) */                                       \
+    M(SettingUInt64, index_granularity_bytes, 0)                                                              \
+                                                                                                              \
+    /** Minimal time in seconds, when merge with TTL can be repeated */                                       \
+    M(SettingInt64, merge_with_ttl_timeout, 3600 * 24)
 
     /// Settings that should not change after the creation of a table.
-#define APPLY_FOR_IMMUTABLE_MERGE_TREE_SETTINGS(M)  \
+#define APPLY_FOR_IMMUTABLE_MERGE_TREE_SETTINGS(M) \
     M(index_granularity)
 
 #define DECLARE(TYPE, NAME, DEFAULT) \
@@ -144,7 +180,7 @@ struct MergeTreeSettings
 #undef DECLARE
 
 public:
-    void loadFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config);
+    void loadFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config);
 
     /// NOTE: will rewrite the AST to add immutable settings.
     void loadFromQuery(ASTStorage & storage_def);

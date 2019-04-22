@@ -17,20 +17,20 @@ int main(int argc, char ** argv)
         return 1;
     }
 
-    size_t limit = std::stol(argv[1]);
+    UInt64 limit = std::stol(argv[1]);
 
     ReadBufferFromFileDescriptor in(STDIN_FILENO);
     WriteBufferFromFileDescriptor out(STDOUT_FILENO);
 
     writeCString("--- first ---\n", out);
     {
-        LimitReadBuffer limit_in(in, limit);
+        LimitReadBuffer limit_in(in, limit, false);
         copyData(limit_in, out);
     }
 
     writeCString("\n--- second ---\n", out);
     {
-        LimitReadBuffer limit_in(in, limit);
+        LimitReadBuffer limit_in(in, limit, false);
         copyData(limit_in, out);
     }
 

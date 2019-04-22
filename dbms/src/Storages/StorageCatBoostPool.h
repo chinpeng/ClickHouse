@@ -14,18 +14,16 @@ public:
 
     std::string getTableName() const override { return table_name; }
 
-    const NamesAndTypesList & getColumnsListImpl() const override { return columns; }
-
     BlockInputStreams read(const Names & column_names,
                            const SelectQueryInfo & query_info,
                            const Context & context,
-                           QueryProcessingStage::Enum & processed_stage,
+                           QueryProcessingStage::Enum processed_stage,
                            size_t max_block_size,
                            unsigned threads) override;
 
 private:
     String table_name;
-    NamesAndTypesList columns;
+
     String column_description_file_name;
     String data_description_file_name;
     Block sample_block;
@@ -55,7 +53,7 @@ private:
                 {"Weight", DatasetColumnType::Weight},
                 {"Baseline", DatasetColumnType::Baseline},
         };
-    };
+    }
 
     std::string getColumnTypesString(const ColumnTypesMap & columnTypesMap);
 

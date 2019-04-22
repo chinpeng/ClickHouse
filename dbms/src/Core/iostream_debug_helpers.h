@@ -2,11 +2,10 @@
 #include <iostream>
 
 #include <Client/Connection.h>
-#include <Common/PODArray.h>
+
 
 namespace DB
 {
-
 class IBlockInputStream;
 std::ostream & operator<<(std::ostream & stream, const IBlockInputStream & what);
 
@@ -25,8 +24,8 @@ std::ostream & operator<<(std::ostream & stream, const IStorage & what);
 class TableStructureReadLock;
 std::ostream & operator<<(std::ostream & stream, const TableStructureReadLock & what);
 
-class IFunction;
-std::ostream & operator<<(std::ostream & stream, const IFunction & what);
+class IFunctionBase;
+std::ostream & operator<<(std::ostream & stream, const IFunctionBase & what);
 
 class Block;
 std::ostream & operator<<(std::ostream & stream, const Block & what);
@@ -37,25 +36,10 @@ std::ostream & operator<<(std::ostream & stream, const ColumnWithTypeAndName & w
 class IColumn;
 std::ostream & operator<<(std::ostream & stream, const IColumn & what);
 
-
-struct SubqueryForSet;
-std::ostream & operator<<(std::ostream & stream, const SubqueryForSet & what);
-
 class IAST;
 std::ostream & operator<<(std::ostream & stream, const IAST & what);
 
-class ExpressionAnalyzer;
-std::ostream & operator<<(std::ostream & stream, const ExpressionAnalyzer & what);
-
 std::ostream & operator<<(std::ostream & stream, const Connection::Packet & what);
-
-template <typename T, size_t INITIAL_SIZE, typename TAllocator, size_t pad_right_>
-std::ostream & operator<<(std::ostream & stream, const PODArray<T, INITIAL_SIZE, TAllocator, pad_right_> & what)
-{
-    stream << "PODArray(size = " << what.size() << ", capacity = " << what.capacity() << ")";
-    dumpContainer(stream, what);
-    return stream;
-};
 
 }
 

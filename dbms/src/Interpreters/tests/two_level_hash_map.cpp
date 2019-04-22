@@ -14,7 +14,7 @@
 
 #include <Core/Types.h>
 #include <IO/ReadBufferFromFile.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <Common/HashTable/TwoLevelHashTable.h>
 #include <Common/HashTable/HashMap.h>
 
@@ -42,7 +42,7 @@ int main(int argc, char ** argv)
         DB::ReadBufferFromFileDescriptor in1(STDIN_FILENO);
         DB::CompressedReadBuffer in2(in1);
 
-        in2.readStrict(reinterpret_cast<char*>(&data[0]), sizeof(data[0]) * n);
+        in2.readStrict(reinterpret_cast<char*>(data.data()), sizeof(data[0]) * n);
 
         watch.stop();
         std::cerr << std::fixed << std::setprecision(2)
@@ -67,8 +67,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(data[i], it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();
@@ -82,7 +82,7 @@ int main(int argc, char ** argv)
         size_t elems = 0;
         for (const auto & kv : map)
         {
-            sum_counts += kv.second;
+            sum_counts += kv.getSecond();
             ++elems;
         }
 
@@ -103,8 +103,8 @@ int main(int argc, char ** argv)
         {
             map.emplace(i, it, inserted);
             if (inserted)
-                it->second = 0;
-            ++it->second;
+                it->getSecond() = 0;
+            ++it->getSecond();
         }
 
         watch.stop();
@@ -118,11 +118,11 @@ int main(int argc, char ** argv)
         size_t elems = 0;
         for (const auto & kv : map)
         {
-            sum_counts += kv.second;
+            sum_counts += kv.getSecond();
             ++elems;
 
-            if (kv.first > n)
-                std::cerr << kv.first << std::endl;
+            if (kv.getFirst() > n)
+                std::cerr << kv.getFirst() << std::endl;
         }
 
         std::cerr << "sum_counts: " << sum_counts << ", elems: " << elems << std::endl;
